@@ -43,6 +43,14 @@ public class JobSchedulerGrain(
 
 ## State Machines
 
+* **Stack**
+* **Priority Queue**
+* **List Lookup**
+* **Set Lookup**
+* **Tree**
+* **Graph**
+
+---
 
 ### `IDurableStack<T>`
 
