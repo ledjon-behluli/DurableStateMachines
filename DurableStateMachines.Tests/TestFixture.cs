@@ -11,6 +11,12 @@ namespace DurableStateMachines.Tests;
 [GenerateSerializer]
 public readonly record struct TryValue<T>(bool Result, [NotNullWhen(true)] T? Item);
 
+[CollectionDefinition(Name)]
+public class GlobalFixture : ICollectionFixture<TestFixture>
+{
+    public const string Name = "Durable State Machines";
+}
+
 public class TestFixture : IAsyncLifetime
 {
     public readonly InProcessTestCluster Cluster;

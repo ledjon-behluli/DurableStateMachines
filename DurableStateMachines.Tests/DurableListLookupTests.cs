@@ -3,7 +3,8 @@ using System.Collections.ObjectModel;
 
 namespace DurableStateMachines.Tests;
 
-public class DurableListLookupTests(TestFixture fixture) : IClassFixture<TestFixture>
+[Collection(GlobalFixture.Name)]
+public class DurableListLookupTests(TestFixture fixture)
 {
     public interface IDurableListLookupGrain : IGrainWithStringKey
     {

@@ -3,7 +3,8 @@ using System.Collections.ObjectModel;
 
 namespace DurableStateMachines.Tests;
 
-public class DurableTreeTests(TestFixture fixture) : IClassFixture<TestFixture>
+[Collection(GlobalFixture.Name)]
+public class DurableTreeTests(TestFixture fixture)
 {
     public interface IDurableTreeGrain : IGrainWithStringKey
     {

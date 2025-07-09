@@ -2,7 +2,8 @@
 
 namespace DurableStateMachines.Tests;
 
-public class DurablePriorityQueueTests(TestFixture fixture) : IClassFixture<TestFixture>
+[Collection(GlobalFixture.Name)]
+public class DurablePriorityQueueTests(TestFixture fixture)
 {
     public interface IDurablePriorityQueueGrain : IGrainWithStringKey
     {

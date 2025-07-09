@@ -3,7 +3,8 @@ using System.Collections.ObjectModel;
 
 namespace DurableStateMachines.Tests;
 
-public class DurableGraphTests(TestFixture fixture) : IClassFixture<TestFixture>
+[Collection(GlobalFixture.Name)]
+public class DurableGraphTests(TestFixture fixture)
 {
     public interface IDurableGraphGrain : IGrainWithStringKey
     {

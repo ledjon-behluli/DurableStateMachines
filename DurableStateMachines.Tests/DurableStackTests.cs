@@ -2,7 +2,8 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace DurableStateMachines.Tests;
 
-public class DurableStackTests(TestFixture fixture) : IClassFixture<TestFixture>
+[Collection(GlobalFixture.Name)]
+public class DurableStackTests(TestFixture fixture)
 {
     public interface IDurableStackGrain : IGrainWithStringKey
     {
