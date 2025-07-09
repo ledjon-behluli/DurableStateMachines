@@ -43,7 +43,7 @@ public class JobSchedulerGrain(
 
 ## Available State Machines
 
-### IDurableStack<T>
+### `IDurableStack<T>`
 
 A classic LIFO stack.
 
@@ -60,7 +60,7 @@ if (stack.TryPop(out var item))
 }
 ```
 
-### IDurablePriorityQueue<TElement, TPriority>
+### `IDurablePriorityQueue<TElement, TPriority>`
 
 A collection where items are dequeued based on priority (*lowest value first*).
 
@@ -76,7 +76,7 @@ var nextTask = queue.Dequeue();
 await WriteStateAsync();
 ```
 
-### IDurableListLookup<TKey, TValue>
+### `IDurableListLookup<TKey, TValue>`
 
 A one-to-many collection that maps a key to a **list** of values, allowing duplicates.
 
@@ -95,7 +95,7 @@ Using a durable dictionary with `List<T>` means every change—like adding or   
 
 `IDurableListLookup<TKey, TValue>` provides fin(er)-grained persistence, where only the specific operation is tracked and stored. It's more efficient for frequent updates and avoids full rewrites for elements of any given key.
 
-### IDurableSetLookup<TKey, TValue>
+### `IDurableSetLookup<TKey, TValue>`
 
 A one-to-many collection that maps a key to a unique **set** of values.
 
@@ -115,7 +115,7 @@ Using a durable dictionary with `HashSet<T>` means every change—like adding or
 
 `IDurableSetLookup<TKey, TValue>` provides fin(er)-grained persistence, where only the specific operation is tracked and stored. It's more efficient for frequent updates and avoids full rewrites for elements of any given key.
 
-### IDurableTree<T>
+### `IDurableTree<T>`
 
 A hierarchical data structure representing parent-child relationships. Models true hierarchies efficiently. Unlike a simple list, it provides fast traversal of children, parents, and descendants, and validates against cyclical relationships.
 
@@ -133,7 +133,7 @@ tree.Move("users", "system");
 await WriteStateAsync();
 ```
 
-### IDurableGraph<TNode, TEdge>
+### `IDurableGraph<TNode, TEdge>`
 
 A flexible structure representing nodes connected by directed edges. A state machine for modeling complex, many-to-many relationships, including dependencies and cycles.
 
