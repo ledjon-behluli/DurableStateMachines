@@ -391,7 +391,7 @@ internal sealed partial class DurableListLookup<TKey, TValue> :
     /// <summary>
     /// Initializes a new <see cref="ValueList"/> holding either a single value or,
     /// once more than one element is added, an <see cref="ImmutableList{TValue}"/>.
-    /// We use <c>ImmutableList&lt;T&gt;</c> rather than <c>List&lt;T&gt;</c> so that:
+    /// We use <see cref="ImmutableList{TValue}"/> rather than <see cref="List{TValue}"/> so that:
     /// <list type="bullet">
     /// <item>
     /// Every mutation (Add/Insert/Remove) returns a fresh instance with structural sharing,
@@ -403,7 +403,7 @@ internal sealed partial class DurableListLookup<TKey, TValue> :
     /// </item>
     /// <item>
     /// We avoid unnecessary allocations for the very common “single‐value” case,
-    /// falling back to an <c>ImmutableList&lt;T&gt;</c> only when needed.
+    /// falling back to an <see cref="ImmutableList{TValue}"/> only when needed.
     /// </item>
     /// </list>
     /// </summary>

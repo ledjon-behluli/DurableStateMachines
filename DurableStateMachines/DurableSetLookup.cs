@@ -393,8 +393,8 @@ internal sealed partial class DurableSetLookup<TKey, TValue> :
 
     /// <summary>
     /// Initializes a new <see cref="ValueSet"/> holding either a single value or,
-    /// once more than one element is added, an <see cref="ImmutableSet{TValue}"/>.
-    /// We use <c>ImmutableSet&lt;T&gt;</c> rather than <c>HashSet&lt;T&gt;</c> so that:
+    /// once more than one element is added, an <see cref="ImmutableHashSet{TValue}"/>.
+    /// We use <see cref="ImmutableHashSet{TValue}"/> rather than <see cref="HashSet{TValue}"/> so that:
     /// <list type="bullet">
     /// <item>
     /// Every mutation (Add/Insert/Remove) returns a fresh instance with structural sharing,
@@ -405,8 +405,8 @@ internal sealed partial class DurableSetLookup<TKey, TValue> :
     /// mutations or shared mutable state.
     /// </item>
     /// <item>
-    /// We avoid unnecessary allocations for the very common “single‐value” case,
-    /// falling back to an <c>ImmutableSet&lt;T&gt;</c> only when needed.
+    /// We avoid unnecessary allocations for the very common single‐value case,
+    /// falling back to an <see cref="ImmutableHashSet{TValue}"/> only when needed.
     /// </item>
     /// </list>
     /// </summary>

@@ -8,6 +8,9 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Ledjon.DurableStateMachines;
 
+/// <summary>
+/// Extensions methods for durable state machines.
+/// </summary>
 public static class HostingExtensions
 {
     /// <summary>
