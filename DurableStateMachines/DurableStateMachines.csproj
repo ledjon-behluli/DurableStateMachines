@@ -34,4 +34,9 @@
     <InternalsVisibleTo Include="DurableStateMachines.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="OrleansLogo.png" Pack="true" PackagePath="" />
+  </ItemGroup>
+
+
 </Project>
