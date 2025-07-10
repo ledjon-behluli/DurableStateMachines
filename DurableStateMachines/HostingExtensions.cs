@@ -10,6 +10,10 @@ namespace Ledjon.DurableStateMachines;
 
 public static class HostingExtensions
 {
+    /// <summary>
+    /// Registers additional state machine implementations that support Orleans journaling,
+    /// enabling durable behavior for common data structures.
+    /// </summary>
     public static IServiceCollection AddDurableStateMachines(this IServiceCollection services)
     {
         services.TryAddKeyedScoped(typeof(IDurableStack<>), KeyedService.AnyKey, typeof(DurableStack<>));
