@@ -583,7 +583,7 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
     /// breadth-first traversals within this class.
     /// </summary>
     /// <remarks>Must be disposed to return the array to the pool.</remarks>
-    private ref struct ValueQueue : IDisposable
+    private struct ValueQueue : IDisposable
     {
         private int _head;
         private int _tail;
