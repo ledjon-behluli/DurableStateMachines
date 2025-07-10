@@ -9,6 +9,24 @@
     <NoWarn>$(NoWarn);ORLEANSEXP005;</NoWarn>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">
+    <PackageId>DurableStateMachines</PackageId>
+    <Version>1.0.0-alpha.1</Version>
+    <Authors>Ledjon Behluli</Authors>
+    <Title>Powerful, high-performance, durable state machine implementations for Orleans</Title>
+    <Description>Powerful, high-performance, durable state machine implementations for Orleans</Description>
+    <Copyright>Copyright (c) Ledjon Behluli</Copyright>
+    <PackageTags>state-machine;dotnet;aspnetcore;orleans;log-storage</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageIconUrl>https://raw.githubusercontent.com/ledjon-behluli/DurableStateMachines/main/OrleansLogo.png</PackageIconUrl>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <RepositoryUrl>https://github.com/ledjon-behluli/DurableStateMachines</RepositoryUrl>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.Orleans.Journaling" Version="9.2.0-preview3.alpha.1" />
   </ItemGroup>
