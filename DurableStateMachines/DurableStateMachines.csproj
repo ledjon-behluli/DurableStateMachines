@@ -10,7 +10,7 @@
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">
-    <PackageId>DurableStateMachines</PackageId>
+    <PackageId>OrleansDurableStateMachines</PackageId>
     <PackageIcon>OrleansLogo.png</PackageIcon>
     <Authors>Ledjon Behluli</Authors>
     <Title>Powerful, high-performance, durable state machine implementations for Orleans</Title>
