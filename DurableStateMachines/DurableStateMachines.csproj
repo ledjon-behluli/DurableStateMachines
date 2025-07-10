@@ -11,7 +11,7 @@
 
   <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">
     <PackageId>DurableStateMachines</PackageId>
-    <PackageIcon>OrleansLogo.png</PackageIcon>
+    <PackageIcon>../OrleansLogo.png</PackageIcon>
     <Authors>Ledjon Behluli</Authors>
     <Title>Powerful, high-performance, durable state machine implementations for Orleans</Title>
     <Description>Powerful, high-performance, durable state machine implementations for Orleans</Description>
@@ -35,7 +35,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="OrleansLogo.png" Pack="true" PackagePath="" />
+    <None Include="../OrleansLogo.png" Pack="true" PackagePath="" />
   </ItemGroup>
 
 
