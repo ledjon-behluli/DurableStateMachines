@@ -1,5 +1,4 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
-using Newtonsoft.Json.Linq;
 using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
@@ -578,7 +577,13 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
         public List<T> Children { get; } = [];
     }
 
-    private struct ValueQueue : IDisposable
+    /// <summary>
+    /// A high-performance, minimal-allocation queue implemented as a stack-only struct.
+    /// It is designed for short-lived, high-frequency operations like the
+    /// breadth-first traversals within this class.
+    /// </summary>
+    /// <remarks>Must be disposed to return the array to the pool.</remarks>
+    private ref struct ValueQueue : IDisposable
     {
         private int _head;
         private int _tail;
@@ -612,7 +617,7 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
 
             item = _array[_head];
 
-            _array[_head] = default!;
+            _array[_head] = default!; // Clear the slot to allow the GC to collect the object if it is a reference type.
             _head = (_head + 1) % _array.Length;
             _count--;
 
@@ -625,24 +630,29 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
 
             if (_count > 0)
             {
+                // The buffer can be in two states:
+                // 1. Contiguous: [_ _, H, I, J, K, T, _, _] where H=head, T=tail.
+                // 2. Wrapped:   [J, K, T, _, _, H, I, _,] where the items wrap around the end.
                 if (_head < _tail)
                 {
+                    // The items are in a contiguous block.
                     Array.Copy(_array, _head, newArray, 0, _count);
                 }
                 else
                 {
-                    int segment1 = _array.Length - _head;
+                
+                    int segment = _array.Length - _head;
 
-                    Array.Copy(_array, _head, newArray, 0, segment1);
-                    Array.Copy(_array, 0, newArray, segment1, _tail);
+                    // The items are in two segments. We copy both to the new array.
+                    Array.Copy(_array, _head, newArray, 0, segment);
+                    Array.Copy(_array, 0, newArray, segment, _tail);
                 }
             }
 
-            Array.Clear(_array, 0, _array.Length);
-            ArrayPool<T>.Shared.Return(_array);
+            ArrayPool<T>.Shared.Return(_array, clearArray: true);
 
             _head = 0;
-            _tail = _count;
+            _tail = _count; // After copying, the new tail is simply the number of items.
             _array = newArray;
         }
 
@@ -650,10 +660,8 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
         {
             if (_array != null)
             {
-                Array.Clear(_array, 0, _array.Length);
-                ArrayPool<T>.Shared.Return(_array);
-
-                _array = null!;
+                ArrayPool<T>.Shared.Return(_array, clearArray: true);
+                _array = null!; // To make extra sure no reference is kept held.
             }
         }
     }
