@@ -4,7 +4,7 @@ A suite of high-performance, specialized durable state machines for [Microsoft O
 
 ## Getting Started
 
-#### 1. Registration
+### Registration
 
 In your silo configuration, register the state machines.
 
@@ -12,7 +12,7 @@ In your silo configuration, register the state machines.
 siloBuilder.Services.AddDurableStateMachines();
 ```
 
-#### 2. Usage
+### Usage
 
 Inherit from `DurableGrain` and inject one or more state machines using the `[FromKeyedServices]` attribute. The key provided is used to isolate the log-based storage for that state machine.
 
@@ -41,7 +41,16 @@ public class JobSchedulerGrain(
 
 ---
 
-## Available State Machines
+## State Machines
+
+* **Stack**
+* **Priority Queue**
+* **List Lookup**
+* **Set Lookup**
+* **Tree**
+* **Graph**
+
+---
 
 ### `IDurableStack<T>`
 
@@ -60,6 +69,8 @@ if (stack.TryPop(out var item))
 }
 ```
 
+---
+
 ### `IDurablePriorityQueue<TElement, TPriority>`
 
 A collection where items are dequeued based on priority (*lowest value first*).
@@ -75,6 +86,8 @@ await WriteStateAsync();
 var nextTask = queue.Dequeue();
 await WriteStateAsync();
 ```
+
+---
 
 ### `IDurableListLookup<TKey, TValue>`
 
@@ -94,6 +107,8 @@ await WriteStateAsync();
 Using a durable dictionary with `List<T>` means every change—like adding or   removing a single item—requires re-serializing and persisting the entire list. This leads to unnecessary overhead and coarse-grained writes.
 
 `IDurableListLookup<TKey, TValue>` provides fin(er)-grained persistence, where only the specific operation is tracked and stored. It's more efficient for frequent updates and avoids full rewrites for elements of any given key.
+
+---
 
 ### `IDurableSetLookup<TKey, TValue>`
 
@@ -115,6 +130,8 @@ Using a durable dictionary with `HashSet<T>` means every change—like adding or
 
 `IDurableSetLookup<TKey, TValue>` provides fin(er)-grained persistence, where only the specific operation is tracked and stored. It's more efficient for frequent updates and avoids full rewrites for elements of any given key.
 
+---
+
 ### `IDurableTree<T>`
 
 A hierarchical data structure representing parent-child relationships. Models true hierarchies efficiently. Unlike a simple list, it provides fast traversal of children, parents, and descendants, and validates against cyclical relationships.
@@ -132,6 +149,8 @@ await WriteStateAsync();
 tree.Move("users", "system");
 await WriteStateAsync();
 ```
+
+---
 
 ### `IDurableGraph<TNode, TEdge>`
 
