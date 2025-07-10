@@ -11,6 +11,7 @@
 
   <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">
     <PackageId>DurableStateMachines</PackageId>
+    <PackageIcon>OrleansLogo.png</PackageIcon>
     <Authors>Ledjon Behluli</Authors>
     <Title>Powerful, high-performance, durable state machine implementations for Orleans</Title>
     <Description>Powerful, high-performance, durable state machine implementations for Orleans</Description>
@@ -23,7 +24,6 @@
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
     <RepositoryUrl>https://github.com/ledjon-behluli/DurableStateMachines</RepositoryUrl>
-    <PackageIcon>https://raw.githubusercontent.com/ledjon-behluli/DurableStateMachines/refs/heads/main/OrleansLogo.png</PackageIcon>
   </PropertyGroup>
 
   <ItemGroup>
@@ -33,5 +33,10 @@
   <ItemGroup>
     <InternalsVisibleTo Include="DurableStateMachines.Tests" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Include="OrleansLogo.png" Pack="true" PackagePath="" />
+  </ItemGroup>
+
 
 </Project>
