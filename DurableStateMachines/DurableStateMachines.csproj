@@ -17,7 +17,7 @@
     <Copyright>Copyright (c) Ledjon Behluli</Copyright>
     <PackageTags>state-machine;dotnet;aspnetcore;orleans;log-storage</PackageTags>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
-    <PackageIconUrl>https://raw.githubusercontent.com/ledjon-behluli/DurableStateMachines/main/OrleansLogo.png</PackageIconUrl>
+    <PackageIcon>https://raw.githubusercontent.com/ledjon-behluli/DurableStateMachines/main/OrleansLogo.png</PackageIcon>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
