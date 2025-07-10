@@ -23,7 +23,7 @@
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
-    <RepositoryUrl>https://github.com/ledjon-behluli/DurableStateMachines</RepositoryUrl>
+    <RepositoryUrl>https://github.com/ledjon-behluli/OrleansDurableStateMachines</RepositoryUrl>
   </PropertyGroup>
 
   <ItemGroup>
