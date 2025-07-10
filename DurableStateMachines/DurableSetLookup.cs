@@ -413,7 +413,7 @@ internal sealed partial class DurableSetLookup<TKey, TValue> :
     private readonly struct ValueSet(object? value) : IEnumerable<TValue>
     {
         /// <summary>
-        /// Stores either a single V or an ImmutableHashSet<V>, we avoid allocating a collection
+        /// Stores either a single V or an <see cref="ImmutableHashSet{TValue}"/>, we avoid allocating a collection
         /// for keys that only have one value associated with them, which is very common.
         /// </summary>
         private readonly object? _value = value;

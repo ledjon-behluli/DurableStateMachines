@@ -410,7 +410,7 @@ internal sealed partial class DurableListLookup<TKey, TValue> :
     private readonly struct ValueList(object? value) : IEnumerable<TValue>
     {
         /// <summary>
-        /// Stores either a single V or an ImmutableList<V>, we avoid allocating a collection
+        /// Stores either a single V or an <see cref="ImmutableList{TValue}"/>, we avoid allocating a collection
         /// for keys that only have one value associated with them, which is very common.
         /// </summary>
         private readonly object? _value = value;
