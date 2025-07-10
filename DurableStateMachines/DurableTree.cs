@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
+using Newtonsoft.Json.Linq;
 using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
@@ -58,7 +59,7 @@ public interface IDurableTree<T> : IEnumerable<T>, IReadOnlyCollection<T> where 
     /// </summary>
     /// <param name="value">The value to set as the root.</param>
     /// <exception cref="InvalidOperationException">Thrown if the tree is not empty.</exception>
-    /// <exception cref="ArgumentException">Thrown if a node with the same value already exists (for future-proofing).</exception>
+    /// <exception cref="ArgumentException">Thrown if a node with the same value already exists.</exception>
     void SetRoot(T value);
 
     /// <summary>
@@ -221,7 +222,8 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
             // must always be processed before its children. If we process a child first, the ApplySnapshot method will fail
             // when it tries to link that child to a parent that does not exist yet in the reconstructed tree.
 
-            var queue = new Queue<T>();
+            using var queue = new ValueQueue();
+
             queue.Enqueue(self.Root);
 
             // We can skip the first item (the root) because we already wrote it.
@@ -419,6 +421,7 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
         return [];
     }
 
+    // We return a lazy evaluated enumerable here, because we have to traverse the tree to find the descendants.
     public IEnumerable<T> GetDescendants(T value)
     {
         if (!_nodes.TryGetValue(value, out Node? node))
@@ -426,7 +429,8 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
             yield break;
         }
 
-        var queue = new Queue<T>();
+        using var queue = new ValueQueue();
+
         foreach (var child in node.Children)
         {
             queue.Enqueue(child);
@@ -462,15 +466,17 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
             return false;
         }
 
-        // Remove node from its parent's children list
+        // Remove node from its parent's children list.
         if (nodeToRemove.Parent is T parent)
         {
             _nodes[parent].Children.Remove(value);
         }
 
-        // Collect all descendants and remove them
-        var queue = new Queue<T>();
+        // Collect all descendants and remove them.
+        using var queue = new ValueQueue();
+
         queue.Enqueue(value);
+
         while (queue.TryDequeue(out var current))
         {
             if (_nodes.TryGetValue(current, out var data))
@@ -480,7 +486,7 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
             }
         }
 
-        // If the root was removed, clear it
+        // If the root was removed, clear it.
         if (EqualityComparer<T>.Default.Equals(_root, value))
         {
             _root = default;
@@ -493,13 +499,13 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
     {
         if (!_nodes.TryGetValue(valueToMove, out var nodeToMoveData) || nodeToMoveData.Parent is null)
         {
-            return false; // Cannot move root or non-existent node
+            return false; // Cannot move root or non just an non-existent node.
         }
 
         var oldParent = nodeToMoveData.Parent;
         if (EqualityComparer<T>.Default.Equals(oldParent, newParentValue))
         {
-            return false; // No change
+            return false; // No change, so skip.
         }
 
         // Unlink from old parent
@@ -520,10 +526,12 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
 
     private bool IsDescendantOf(T potentialDescendant, T potentialAncestor)
     {
-        var queue = new Queue<T>();
+        using var queue = new ValueQueue();
+
         queue.Enqueue(potentialAncestor);
 
         var comparer = EqualityComparer<T>.Default;
+
         while (queue.TryDequeue(out var current))
         {
             if (comparer.Equals(current, potentialDescendant))
@@ -568,6 +576,86 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
     {
         public T? Parent { get; set; } = parent;
         public List<T> Children { get; } = [];
+    }
+
+    private struct ValueQueue : IDisposable
+    {
+        private int _head;
+        private int _tail;
+        private int _count;
+        private T[] _array;
+
+        public ValueQueue()
+        {
+            _array = ArrayPool<T>.Shared.Rent(4);
+        }
+
+        public void Enqueue(T item)
+        {
+            if (_count == _array.Length)
+            {
+                Grow();
+            }
+
+            _array[_tail] = item;
+            _tail = (_tail + 1) % _array.Length;
+            _count++;
+        }
+
+        public bool TryDequeue([MaybeNullWhen(false)] out T item)
+        {
+            if (_count == 0)
+            {
+                item = default;
+                return false;
+            }
+
+            item = _array[_head];
+
+            _array[_head] = default!;
+            _head = (_head + 1) % _array.Length;
+            _count--;
+
+            return true;
+        }
+
+        private void Grow()
+        {
+            var newArray = ArrayPool<T>.Shared.Rent(_array.Length * 2);
+
+            if (_count > 0)
+            {
+                if (_head < _tail)
+                {
+                    Array.Copy(_array, _head, newArray, 0, _count);
+                }
+                else
+                {
+                    int segment1 = _array.Length - _head;
+
+                    Array.Copy(_array, _head, newArray, 0, segment1);
+                    Array.Copy(_array, 0, newArray, segment1, _tail);
+                }
+            }
+
+            Array.Clear(_array, 0, _array.Length);
+            ArrayPool<T>.Shared.Return(_array);
+
+            _head = 0;
+            _tail = _count;
+            _array = newArray;
+        }
+
+        public void Dispose()
+        {
+            if (_array != null)
+            {
+                Array.Clear(_array, 0, _array.Length);
+                ArrayPool<T>.Shared.Return(_array);
+
+                _array = null!;
+            }
+        }
     }
 }
 
