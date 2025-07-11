@@ -578,7 +578,7 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
     }
 
     /// <summary>
-    /// A high-performance, minimal-allocation queue implemented as a stack-only struct.
+    /// A high-performance, minimal-allocation queue implemented as a struct.
     /// It is designed for short-lived, high-frequency operations like the
     /// breadth-first traversals within this class.
     /// </summary>
