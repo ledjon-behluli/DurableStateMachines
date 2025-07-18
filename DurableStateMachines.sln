@@ -6,6 +6,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DurableStateMachines", "Dur
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DurableStateMachines.Tests", "DurableStateMachines.Tests\DurableStateMachines.Tests.csproj", "{F2863845-167F-4CAD-9E75-10E628C8C59F}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "playground", "playground", "{8F58FC27-92EF-4B9C-8E65-F1663DE04942}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DurableStateMachines.CTS", "playground\DurableStateMachines.CTS\DurableStateMachines.CTS.csproj", "{2C91AFDD-4308-4491-949F-6578B856EEBE}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -20,8 +24,15 @@ Global
 		{F2863845-167F-4CAD-9E75-10E628C8C59F}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{F2863845-167F-4CAD-9E75-10E628C8C59F}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{F2863845-167F-4CAD-9E75-10E628C8C59F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2C91AFDD-4308-4491-949F-6578B856EEBE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2C91AFDD-4308-4491-949F-6578B856EEBE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2C91AFDD-4308-4491-949F-6578B856EEBE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2C91AFDD-4308-4491-949F-6578B856EEBE}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{2C91AFDD-4308-4491-949F-6578B856EEBE} = {8F58FC27-92EF-4B9C-8E65-F1663DE04942}
 	EndGlobalSection
 EndGlobal
