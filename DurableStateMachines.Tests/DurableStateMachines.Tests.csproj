@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
-    <NoWarn>$(NoWarn);ORLEANSEXP005;</NoWarn>
+    <NoWarn>$(NoWarn);CS1574;ORLEANSEXP005;</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

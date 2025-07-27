@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
-    <NoWarn>$(NoWarn);ORLEANSEXP005;</NoWarn>
+    <NoWarn>$(NoWarn);CS1574;ORLEANSEXP005;</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
