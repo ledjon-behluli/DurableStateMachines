@@ -51,6 +51,7 @@ public class JobSchedulerGrain(
 * **Set Lookup**
 * **Tree**
 * **Graph**
+* **Cancellation Token Source**
 
 ---
 
@@ -170,6 +171,76 @@ graph.AddEdge("TaskB", "TaskC", "Depends on");
 graph.AddEdge("TaskC", "TaskA", "Blocks"); // Cycles are allowed!
 
 await WriteStateAsync();
+```
+
+---
+
+### `IDurableCancellationTokenSource`
+
+A durable, persistent version of the standard  `CancellationTokenSource`. It allows a cancellation signal to survive grain deactivation and reactivation.
+
+**Useful for:**
+
+-   Implementing reliable, supervisory timeouts for long-running jobs.
+-   Propagating a cancellation request across multiple grains or services.
+-   Ensuring that a user-initiated cancellation is permanent and honored even if the grain restarts.
+
+#### Key Concepts
+
+-   **`IsCancellationPending`** -  This boolean reflects the  **immediate, in-memory status**. It returns  `true`  as soon as  `Cancel()`  is called or a  `CancelAfter()`  timer expires. Use this for quick, synchronous checks before the state is durably saved.
+    
+-   **`Token`** -  This is the standard  `CancellationToken`  you pass to other methods. This token is only signaled  **after**  the cancellation has been durably persisted via  `WriteStateAsync()`. This represents the  **committed**  state of cancellation.
+    
+-   **`Cancel()`** -  Sets  `IsCancellationPending`  to  `true`  in memory. To make the cancellation take effect and signal the  `Token`, you must follow up with a call to  `WriteStateAsync()`.
+    
+-   **`CancelAfter(TimeSpan delay)`** -  Schedules a future cancellation. This method has two key behaviors:
+    
+    1.  **Persisting the Intent:**  You must call  `WriteStateAsync()`  to make the scheduled timeout durable across restarts.
+    2.  **Automatic Persistence:**  Once the timer expires, the component will  **automatically trigger its own persistence**, setting the final canceled state without requiring another manual  `WriteStateAsync()`  call.
+
+#### Callbacks and Threading
+
+Any callbacks registered via  `Token.Register()`  will execute on the default  `TaskScheduler`  (usually the .NET thread pool). This means callbacks will run  **outside the Orleans grain scheduler**, which is important to know for thread safety and accessing grain state.
+
+#### Simple Cancellable Operation
+
+> For more advanced examples, including job orchestration and distributed cancellation, see the [**playground**](https://github.com/ledjon-behluli/DurableStateMachines/blob/main/playground/DurableStateMachines.CTS/Program.cs) app.
+
+```csharp
+public class LongRunningTaskGrain(
+    [FromKeyedServices("task-cancel")]
+    IDurableCancellationTokenSource cancelSource)
+        : DurableGrain, ILongRunningTaskGrain
+{
+    public async Task StartTaskWithTimeout(TimeSpan timeout)
+    {
+        cancelSource.CancelAfter(timeout);
+        await WriteStateAsync();
+        ProcessItems(cancelSource.Token).Ignore();
+    }
+
+    public async Task CancelTaskByUser()
+    {
+        cancelSource.Cancel();
+        await WriteStateAsync();
+    }
+
+    private async Task ProcessItems(CancellationToken token)
+    {
+        try
+        {
+            await foreach (var item in GetItemsFromSource(token))
+            {
+                // This loop will be gracefully terminated
+                // if 'token' is signaled.
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Ignore
+        }
+    }
+}
 ```
 
 ---
