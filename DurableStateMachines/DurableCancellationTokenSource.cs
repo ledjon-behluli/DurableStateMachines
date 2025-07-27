@@ -88,7 +88,7 @@ public interface IDurableCancellationTokenSource
     void CancelAfter(TimeSpan delay);
 }
 
-[DebuggerDisplay("IsCanceled = {IsCancellationRequested}")]
+[DebuggerDisplay("Pending = {IsCancellationPending}, Requested = {Token.IsCancellationRequested}, Scheduled = {_scheduledCancellation.IsScheduled}")]
 internal sealed class DurableCancellationTokenSource : IDurableCancellationTokenSource, IDurableStateMachine, IDisposable
 {
     private const byte VersionByte = 0;
