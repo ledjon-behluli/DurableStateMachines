@@ -1,5 +1,4 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
-using static DurableStateMachines.Tests.DurableObjectTests;
 
 namespace DurableStateMachines.Tests;
 
@@ -13,6 +12,7 @@ public class DurableObjectTests(TestFixture fixture)
         [Id(1)] public ClassNestedState Nested { get; set; } = new();
         [Id(2)] public List<string> Items { get; set; } = [];
         [Id(3)] public Dictionary<string, int> Mappings { get; set; } = [];
+        [Id(4)] public RecordStructNestedState NestedStruct { get; set; }
     }
 
     [GenerateSerializer]
@@ -21,18 +21,21 @@ public class DurableObjectTests(TestFixture fixture)
         [Id(0)] public string? Name { get; set; }
     }
 
+    [GenerateSerializer]
+    public record struct RecordStructNestedState(int Value);
+
     public interface IDurableObjectGrain : IGrainWithStringKey
     {
         Task<bool> RecordExists();
         Task<ClassState> GetState();
         Task SetNullState();
         Task ReplaceState(ClassState newState);
-        Task MutateState(string nestedName, string listItem, string mapKey, int mapValue);
+        Task MutateState(string nestedName, string listItem, string mapKey, int mapValue, int structValue);
     }
 
     public class DurableObjectGrain(
         [FromKeyedServices("state")] IDurableObject<ClassState> state)
-            : DurableGrain, IDurableObjectGrain
+          : DurableGrain, IDurableObjectGrain
     {
         public Task<bool> RecordExists() => Task.FromResult(state.RecordExists);
         public Task<ClassState> GetState() => Task.FromResult(state.Value);
@@ -42,12 +45,13 @@ public class DurableObjectTests(TestFixture fixture)
             return Task.CompletedTask;
         }
 
-        public async Task MutateState(string nestedName, string listItem, string mapKey, int mapValue)
+        public async Task MutateState(string nestedName, string listItem, string mapKey, int mapValue, int structValue)
         {
             state.Value.Counter++;
             state.Value.Nested.Name = nestedName;
             state.Value.Items.Add(listItem);
             state.Value.Mappings[mapKey] = mapValue;
+            state.Value.NestedStruct = new RecordStructNestedState(structValue);
 
             await WriteStateAsync();
         }
@@ -75,7 +79,7 @@ public class DurableObjectTests(TestFixture fixture)
 
     public class DurableObjectRecordGrain(
         [FromKeyedServices("state")] IDurableObject<RecordState> state)
-            : DurableGrain, IDurableObjectRecordGrain
+          : DurableGrain, IDurableObjectRecordGrain
     {
         public Task<bool> RecordExists() => Task.FromResult(state.RecordExists);
         public Task<RecordState> GetState() => Task.FromResult(state.Value);
@@ -116,6 +120,7 @@ public class DurableObjectTests(TestFixture fixture)
         Assert.Empty(state.Items);
         Assert.NotNull(state.Mappings);
         Assert.Empty(state.Mappings);
+        Assert.Equal(default, state.NestedStruct);
     }
 
     [Fact]
@@ -123,8 +128,8 @@ public class DurableObjectTests(TestFixture fixture)
     {
         var grain = GetGrain("mutate");
 
-        await grain.MutateState("nested-name", "list-item-1", "map-key-1", 100);
-        await grain.MutateState("new-nested-name", "list-item-2", "map-key-2", 200);
+        await grain.MutateState("nested-name", "list-item-1", "map-key-1", 100, 50);
+        await grain.MutateState("new-nested-name", "list-item-2", "map-key-2", 200, 60);
 
         var exists = await grain.RecordExists();
         var state = await grain.GetState();
@@ -138,6 +143,7 @@ public class DurableObjectTests(TestFixture fixture)
         Assert.Equal(2, state.Mappings.Count);
         Assert.Equal(100, state.Mappings["map-key-1"]);
         Assert.Equal(200, state.Mappings["map-key-2"]);
+        Assert.Equal(60, state.NestedStruct.Value);
     }
 
     [Fact]
@@ -149,7 +155,8 @@ public class DurableObjectTests(TestFixture fixture)
             Counter = 99,
             Nested = new ClassNestedState { Name = "replaced-nested" },
             Items = ["a", "b"],
-            Mappings = new Dictionary<string, int> { { "k", 1 } }
+            Mappings = new Dictionary<string, int> { { "k", 1 } },
+            NestedStruct = new RecordStructNestedState(123)
         };
 
         await grain.ReplaceState(newState);
@@ -163,6 +170,7 @@ public class DurableObjectTests(TestFixture fixture)
         Assert.Equal(["a", "b"], state.Items);
         Assert.Single(state.Mappings);
         Assert.Equal(1, state.Mappings["k"]);
+        Assert.Equal(123, state.NestedStruct.Value);
     }
 
     [Fact]
@@ -173,7 +181,7 @@ public class DurableObjectTests(TestFixture fixture)
         var existsBefore = await grain.RecordExists();
         Assert.False(existsBefore);
 
-        await grain.MutateState("final-name", "final-item", "final-key", 999);
+        await grain.MutateState("final-name", "final-item", "final-key", 999, 777);
 
         var stateBefore = await grain.GetState();
 
@@ -187,6 +195,7 @@ public class DurableObjectTests(TestFixture fixture)
         Assert.Equal(stateBefore.Nested.Name, stateAfter.Nested.Name);
         Assert.Equal(stateBefore.Items, stateAfter.Items);
         Assert.Equal(stateBefore.Mappings, stateAfter.Mappings);
+        Assert.Equal(stateBefore.NestedStruct, stateAfter.NestedStruct);
     }
 
     [Fact]
