@@ -1,8 +1,8 @@
-# DurableStateMachines
+# OrleansDurableStateMachines
 
 A suite of high-performance, specialized durable state machines for [Microsoft Orleans](https://github.com/dotnet/orleans). These state machines provide rich, structured data management inside a grain with efficient, fine-grained persistence.
 
-[![NuGet](https://img.shields.io/nuget/v/DurableStateMachines.svg)](https://www.nuget.org/packages/DurableStateMachines/)
+[![NuGet](https://img.shields.io/nuget/v/OrleansDurableStateMachines.svg)](https://www.nuget.org/packages/OrleansDurableStateMachines/)
 
 ## Getting Started
 
