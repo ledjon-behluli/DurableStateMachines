@@ -249,6 +249,8 @@ public class LongRunningTaskGrain(
 
 A streamlined container for a single complex object (POCO) that allows for direct mutation of its properties. The idea behind  `IDurableObject<T>`  came from the desire to create the "best of both worlds": an API with the simplicity of `IDurableValue<T>`, but with the ability to mutate a complex object directly like `IPersistentState<T>`.
 
+> Ideally you should not be making the object complex, but instead use the appropriate state machines for lists, sets, dictionary, etc...
+
 **Useful for:**  Managing any complex state class, like a  `UserProfile`,  `GameSession`, or  `OrderDetails`, without the ceremony of creating new instances for every change.
 
 ```csharp
