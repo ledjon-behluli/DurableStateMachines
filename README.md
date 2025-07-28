@@ -45,13 +45,14 @@ public class JobSchedulerGrain(
 
 ## State Machines
 
-* **Stack**
-* **Priority Queue**
-* **List Lookup**
-* **Set Lookup**
-* **Tree**
-* **Graph**
-* **Cancellation Token Source**
+* [Stack](#idurablestackt)
+* [Priority Queue](#idurablepriorityqueuetelement-tpriority)
+* [List Lookup](#idurablelistlookuptkey-tvalue)
+* [Set Lookup](#idurablesetlookuptkey-tvalue)
+* [Tree](#idurabletreet)
+* [Graph](#idurablegraphtnode-tedge)
+* [Cancellation Token Source](#idurablecancellationtokensource)
+* [Object](#idurableobjectt)
 
 ---
 
@@ -242,6 +243,86 @@ public class LongRunningTaskGrain(
     }
 }
 ```
+
+---
+### `IDurableObject<T>`
+
+A streamlined container for a single complex object (POCO) that allows for direct mutation of its properties. The idea behind  `IDurableObject<T>`  came from the desire to create the "best of both worlds": an API with the simplicity of `IDurableValue<T>`, but with the ability to mutate a complex object directly like `IPersistentState<T>`.
+
+**Useful for:**  Managing any complex state class, like a  `UserProfile`,  `GameSession`, or  `OrderDetails`, without the ceremony of creating new instances for every change.
+
+```csharp
+// Direct mutation is the intended pattern.
+
+state.Value.Counter++;
+state.Value.LastUpdated = DateTime.UtcNow;
+state.Value.Nested.Name = "New Nested Name";
+
+await WriteStateAsync();
+
+```
+
+#### Why not use  `IDurableValue<T>`  for complex objects?
+
+While possible, it's cumbersome and dare I say even error-prone. You must create a new object instance for every change, which can lead to verbose code and bugs if you forget to copy a property.
+
+```csharp
+// Assume you have an IDurableValue<MyState> named 'state'.
+
+// ------------- Incorrect approach -------------
+
+// We intuitively mutate the object directly. 
+// This changes the in-memory object, but the state machine
+// doesn't know a change occurred.
+
+// The setter for 'state.Value' was never called, 
+// so this write does nothing. 
+
+state.Value.Counter++;
+await WriteStateAsync();
+
+// After a re-activation, the counter change above will be lost.
+
+// ------------- Correct approach -------------
+
+var newState = new MyState 
+{ 
+	Counter = state.Value.Counter + 1,
+	Name = state.Value.Name
+};
+
+// We need to assign the new instance to trigger the setter.
+
+state.Value = newState; 
+await WriteStateAsync();
+
+// Now the change is persisted correctly.
+```
+
+#### Why not just use  `IPersistentState<T>`?
+
+`DurableState<T>`  (*the implementation of  `IPersistentState<T>`*) exists primarily for  **familiarity and migration**  from the classic Orleans state model. It works, but it **has to** bring along some jargon and potential confusion:
+
+-   **Extra API Surface:**  It exposes the full  `IStorage<T>`  contract, including  `Etag`,  `ClearStateAsync()`, etc., which are not needed when using  `DurableGrain`.
+
+-   **Confusing Write Calls:**  You can call  `state.State.WriteStateAsync()`, which feels disconnected from the  `DurableGrain`'s own  `WriteStateAsync()`  method.
+
+`IDurableObject<T>`  is the purpose-built, ergonomic choice for this library. It provides only the essential features (`Value`,  `RecordExists`) in a cleaner package, making your grain code simpler and more predictable.
+
+#### Why Can't  `Value`  be set to  `null`?
+
+This is a deliberate design choice for safety and predictability. The  `get`  accessor for  `Value`  guarantees it will never return  `null`  (*it creates a new instance if one doesn't exist*). Allowing the setter to accept  `null`  would create a confusing and inconsistent state.
+
+```csharp
+// This is NOT allowed and will throw an ArgumentNullException:
+state.Value = null;
+```
+
+By disallowing  `null`,  `IDurableObject<T>`  ensures that you can always safely access and mutate the state object without needing to perform null checks, preventing a common source of  `NullReferenceException`s.
+
+#### Why no  `Etag`?
+
+An `Etag` is a token used to detect race conditions where multiple processes might update the same record. This component doesn't need one because Orleans ensures only a single grain activation is the "writer," and all changes are appended to an immutable log using a custom binary protocol. Any process attempting to write to the log outside the state machine would corrupt the state, making external updates inherently not feasible, and even unsafe.
 
 ---
 
