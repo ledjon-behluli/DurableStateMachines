@@ -1,3 +1,4 @@
+
 # OrleansDurableStateMachines
 
 A suite of high-performance, specialized durable state machines for [Microsoft Orleans](https://github.com/dotnet/orleans). These state machines provide rich, structured data management inside a grain with efficient, fine-grained persistence.
@@ -47,8 +48,10 @@ public class JobSchedulerGrain(
 
 * [Stack](#idurablestackt)
 * [Priority Queue](#idurablepriorityqueuetelement-tpriority)
+* [Ordered Set](#idurableorderedsett)
 * [List Lookup](#idurablelistlookuptkey-tvalue)
 * [Set Lookup](#idurablesetlookuptkey-tvalue)
+* [Ordered Set Lookup](#idurableorderedsetlookuptkey-tvalue)
 * [Tree](#idurabletreet)
 * [Graph](#idurablegraphtnode-tedge)
 * [Cancellation Token Source](#idurablecancellationtokensource)
@@ -89,6 +92,30 @@ await WriteStateAsync();
 // Dequeue will always return "High priority task" first.
 var nextTask = queue.Dequeue();
 await WriteStateAsync();
+```
+
+### `IDurableOrderedSet<T>`
+
+A collection of unique items that preserves their original insertion order. It combines the uniqueness of a set with the ordering of a list.
+
+**Useful for:** Tracking a sequence of unique events, processing queue for unique jobs.
+
+```csharp
+// Add returns true if the item was new
+if (history.Add("user_logged_in"))
+{
+    await WriteStateAsync();
+}
+
+// This will return false and do nothing 
+// because the item already exists.
+history.Add("user_logged_in");
+
+// The collection can be read efficiently in order.
+foreach (var action in history.OrderedItems)
+{
+    // Process actions...
+}
 ```
 
 ---
@@ -133,6 +160,45 @@ if (lookup.Add(userId, "Admin"))
 Using a durable dictionary with `HashSet<T>` means every change—like adding or   removing a single item—requires re-serializing and persisting the entire list. This leads to unnecessary overhead and coarse-grained writes.
 
 `IDurableSetLookup<TKey, TValue>` provides fin(er)-grained persistence, where only the specific operation is tracked and stored. It's more efficient for frequent updates and avoids full rewrites for elements of any given key.
+
+---
+
+### `IDurableOrderedSetLookup<TKey, TValue>`
+
+A one-to-many collection that maps a key to a unique  **set**  of values that maintains  **insertion order**. 
+
+**Useful for:**
+
+-   Tracking user achievements or badges in the exact order they were earned.
+-   Managing ordered, unique dependencies for a build system.
+-   Storing timelines of unique events per entity (e.g.,  `lookup.Add(userId, "LoggedIn")`,  `lookup.Add(userId, "ViewedProduct")`).
+
+```csharp
+// Track the unique products a user viewed, in order.
+lookup.Add(userId, "product-123");
+lookup.Add(userId, "product-456");
+
+// This call will return false and have no effect,
+// as the product is already in the set for this user.
+lookup.Add(userId, "product-123");
+
+await WriteStateAsync();
+
+// The values for a key are always returned 
+// in their original insertion order.
+
+// -> ["product-123", "product-456"]
+var viewedProducts = lookup[userId];
+```
+
+**Why use  `IDurableOrderedSetLookup<,>`?**  
+
+When you need both uniqueness and order for values associated with a key.
+
+-   `IDurableListLookup<,>`  **allows duplicate** values!
+    `IDurableOrderedSetLookup<,>`  **enforces uniqueness**, which is safer if duplicates are not desired.
+    
+-   `IDurableSetLookup<,>` **provides uniqueness** but does  **not  guarantee** any specific order.  `IDurableOrderedSetLookup<,>`  preserves the original **insertion order**, making it ideal for sequences, histories, or timelines.
 
 ---
 
