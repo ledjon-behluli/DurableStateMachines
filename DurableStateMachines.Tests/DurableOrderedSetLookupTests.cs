@@ -4,9 +4,9 @@ using System.Collections.ObjectModel;
 namespace DurableStateMachines.Tests;
 
 [Collection(GlobalFixture.Name)]
-public class DurableSetLookupTests(TestFixture fixture)
+public class DurableOrderedSetLookupTests(TestFixture fixture)
 {
-    public interface IDurableSetLookupGrain : IGrainWithStringKey
+    public interface IDurableOrderedSetLookupGrain : IGrainWithStringKey
     {
         Task<bool> Add(string key, string value);
         Task<bool> RemoveKey(string key);
@@ -20,21 +20,29 @@ public class DurableSetLookupTests(TestFixture fixture)
         Task<Dictionary<string, List<string>>> GetAll();
     }
 
-    public class DurableSetLookupGrain([FromKeyedServices("set_lookup")]
-        IDurableSetLookup<string, string> state) : DurableGrain, IDurableSetLookupGrain
+    public class DurableOrderedSetLookupGrain([FromKeyedServices("ordered_set_lookup")]
+        IDurableOrderedSetLookup<string, string> state) : DurableGrain, IDurableOrderedSetLookupGrain
     {
         public async Task<bool> Add(string key, string value)
         {
             var result = state.Add(key, value);
-            await WriteStateAsync();
-
+            
+            if (result)
+            {
+                await WriteStateAsync();
+            }
+            
             return result;
         }
 
         public async Task<bool> RemoveKey(string key)
         {
             var result = state.Remove(key);
-            await WriteStateAsync();
+            
+            if (result)
+            {
+                await WriteStateAsync();
+            }
             
             return result;
         }
@@ -42,8 +50,10 @@ public class DurableSetLookupTests(TestFixture fixture)
         public async Task<bool> RemoveItem(string key, string value)
         {
             var result = state.Remove(key, value);
-            await WriteStateAsync();
-            
+            if (result)
+            {
+                await WriteStateAsync();
+            }
             return result;
         }
 
@@ -54,15 +64,15 @@ public class DurableSetLookupTests(TestFixture fixture)
         }
 
         public Task<ReadOnlyCollection<string>> GetValues(string key) =>
-            Task.FromResult(new ReadOnlyCollection<string>([.. state[key]]));
+          Task.FromResult(new ReadOnlyCollection<string>([.. state[key]]));
 
         public Task<ReadOnlyCollection<string>> GetKeys() =>
-            Task.FromResult(new ReadOnlyCollection<string>([.. state.Keys]));
+          Task.FromResult(new ReadOnlyCollection<string>([.. state.Keys]));
 
         public Task<int> GetCount() => Task.FromResult(state.Count);
 
         public Task<bool> ContainsKey(string key) => Task.FromResult(state.Contains(key));
-
+        
         public Task<bool> ContainsItem(string key, string value) => Task.FromResult(state.Contains(key, value));
 
         public Task<Dictionary<string, List<string>>> GetAll()
@@ -72,8 +82,8 @@ public class DurableSetLookupTests(TestFixture fixture)
         }
     }
 
-    private IDurableSetLookupGrain GetGrain(string key) => fixture.Cluster.Client.GetGrain<IDurableSetLookupGrain>(key);
-    private static ValueTask DeactivateGrain(IDurableSetLookupGrain grain) => grain.Cast<IGrainManagementExtension>().DeactivateOnIdle();
+    private IDurableOrderedSetLookupGrain GetGrain(string key) => fixture.Cluster.Client.GetGrain<IDurableOrderedSetLookupGrain>(key);
+    private static ValueTask DeactivateGrain(IDurableOrderedSetLookupGrain grain) => grain.Cast<IGrainManagementExtension>().DeactivateOnIdle();
 
     [Fact]
     public async Task EmptyOperations()
@@ -82,6 +92,7 @@ public class DurableSetLookupTests(TestFixture fixture)
 
         Assert.Equal(0, await grain.GetCount());
         Assert.False(await grain.ContainsKey("nonexistent"));
+        Assert.False(await grain.ContainsItem("nonexistent", "value"));
 
         var values = await grain.GetValues("nonexistent");
         Assert.Empty(values);
@@ -94,101 +105,47 @@ public class DurableSetLookupTests(TestFixture fixture)
     }
 
     [Fact]
-    public async Task BasicOperations()
+    public async Task UniquenessAndOrder()
     {
-        var grain = GetGrain("basic");
+        var grain = GetGrain("unique_order");
 
-        Assert.True(await grain.Add("key1", "val1_1"));
-        Assert.Equal(1, await grain.GetCount());
-        Assert.True(await grain.ContainsKey("key1"));
-        Assert.True(await grain.ContainsItem("key1", "val1_1"));
-        Assert.False(await grain.ContainsItem("key1", "nonexistent"));
-        Assert.Equal(["val1_1"], await grain.GetValues("key1"));
-
-        Assert.True(await grain.Add("key1", "val1_2"));
-        Assert.Equal(1, await grain.GetCount());
-        Assert.True(await grain.ContainsItem("key1", "val1_2"));
-        Assert.Equivalent(new[] { "val1_1", "val1_2" }, await grain.GetValues("key1"));
-
-        Assert.True(await grain.Add("key2", "val2_1"));
-        Assert.Equal(2, await grain.GetCount());
-        Assert.Equivalent(new[] { "key1", "key2" }, await grain.GetKeys());
-
-        var removedItem = await grain.RemoveItem("key1", "val1_1");
-        Assert.True(removedItem);
-        Assert.False(await grain.ContainsItem("key1", "val1_1"));
-        Assert.Equal(["val1_2"], await grain.GetValues("key1"));
-
-        var removedKey = await grain.RemoveKey("key2");
-        Assert.True(removedKey);
-        Assert.Equal(1, await grain.GetCount());
-        Assert.False(await grain.ContainsKey("key2"));
-
-        await grain.RemoveItem("key1", "val1_2");
-        Assert.Equal(0, await grain.GetCount());
-        Assert.False(await grain.ContainsKey("key1"));
-    }
-
-    [Fact]
-    public async Task IgnoresDuplicates()
-    {
-        var grain = GetGrain("duplicates");
-
+        Assert.True(await grain.Add("key1", "c"));
         Assert.True(await grain.Add("key1", "a"));
         Assert.True(await grain.Add("key1", "b"));
 
-        // Note: adding a duplicate value to a set should be ignored.
+        Assert.Equal(1, await grain.GetCount());
+        Assert.True(await grain.ContainsKey("key1"));
+
+        var expectedOrder = new List<string> { "c", "a", "b" };
+        Assert.Equal(expectedOrder, await grain.GetValues("key1"));
+
+        Assert.True(await grain.ContainsItem("key1", "a"));
+        Assert.False(await grain.ContainsItem("key1", "z"));
+
         Assert.False(await grain.Add("key1", "a"));
         Assert.Equal(1, await grain.GetCount());
+        Assert.Equal(expectedOrder, await grain.GetValues("key1"));
 
-        Assert.Equivalent(new[] { "a", "b" }, await grain.GetValues("key1"));
+        Assert.True(await grain.RemoveItem("key1", "a"));
+        expectedOrder.Remove("a");
+        Assert.Equal(expectedOrder, await grain.GetValues("key1"));
+
+        Assert.False(await grain.RemoveItem("key1", "z"));
     }
 
     [Fact]
-    public async Task RemoveKey()
+    public async Task RemoveItem_RemovesKeyWhenEmpty()
     {
-        var grain = GetGrain("remove_key");
+        var grain = GetGrain("remove_item_empties_key");
 
         await grain.Add("key1", "a");
         await grain.Add("key1", "b");
-        await grain.Add("key2", "c");
-        await grain.Add("key3", "d");
 
-        Assert.True(await grain.RemoveKey("key2"));
-        Assert.Equal(2, await grain.GetCount());
-
+        Assert.True(await grain.RemoveItem("key1", "a"));
         Assert.True(await grain.ContainsKey("key1"));
-        Assert.False(await grain.ContainsKey("key2"));
-        Assert.True(await grain.ContainsKey("key3"));
-
-        Assert.Equivalent(new[] { "a", "b" }, await grain.GetValues("key1"));
-        Assert.Empty(await grain.GetValues("key2"));
-        Assert.Equal(["d"], await grain.GetValues("key3"));
-
-        Assert.False(await grain.RemoveKey("nonexistent"));
-    }
-
-    [Fact]
-    public async Task RemoveItem()
-    {
-        var grain = GetGrain("remove_item");
-
-        await grain.Add("key1", "a");
-        await grain.Add("key1", "b");
-        await grain.Add("key1", "c");
+        Assert.Equal(1, await grain.GetCount());
 
         Assert.True(await grain.RemoveItem("key1", "b"));
-        Assert.Equivalent(new[] { "a", "c" }, await grain.GetValues("key1"));
-
-        // Attempting to remove a value that does not exist should do nothing.
-        Assert.False(await grain.RemoveItem("key1", "z"));
-        Assert.Equivalent(new[] { "a", "c" }, await grain.GetValues("key1"));
-
-        // Remove the rest of the items.
-        Assert.True(await grain.RemoveItem("key1", "a"));
-        Assert.True(await grain.RemoveItem("key1", "c"));
-
-        // When the last item is removed, the key should also be removed.
         Assert.False(await grain.ContainsKey("key1"));
         Assert.Equal(0, await grain.GetCount());
     }
@@ -197,6 +154,7 @@ public class DurableSetLookupTests(TestFixture fixture)
     public async Task Persistence()
     {
         var grain = GetGrain("persist");
+        var expectedOrder = new List<string> { "a", "b", "c" };
 
         await grain.Add("key1", "a");
         await grain.Add("key1", "b");
@@ -206,7 +164,7 @@ public class DurableSetLookupTests(TestFixture fixture)
 
         Assert.Equal(2, await grain.GetCount());
         Assert.Equivalent(new[] { "key1", "key2" }, await grain.GetKeys());
-        Assert.Equivalent(new[] { "a", "b" }, await grain.GetValues("key1"));
+        Assert.Equal(["a", "b"], await grain.GetValues("key1"));
         Assert.Equal(["c"], await grain.GetValues("key2"));
 
         await grain.RemoveItem("key1", "a");
@@ -228,6 +186,9 @@ public class DurableSetLookupTests(TestFixture fixture)
         await grain.Clear();
         Assert.Equal(0, await grain.GetCount());
         Assert.Empty(await grain.GetKeys());
+
+        await DeactivateGrain(grain);
+        Assert.Equal(0, await grain.GetCount());
     }
 
     [Fact]
@@ -235,19 +196,27 @@ public class DurableSetLookupTests(TestFixture fixture)
     {
         var grain = GetGrain("enum");
 
+        var expected = new Dictionary<string, List<string>>
+        {
+            ["key1"] = ["a", "b"],
+            ["key2"] = ["c"],
+            ["key3"] = ["f", "e", "d"]
+        };
+
         await grain.Add("key1", "a");
         await grain.Add("key1", "b");
         await grain.Add("key2", "c");
-        await grain.Add("key3", "d");
-        await grain.Add("key3", "e");
         await grain.Add("key3", "f");
+        await grain.Add("key3", "e");
+        await grain.Add("key3", "d");
 
         var actual = await grain.GetAll();
 
-        Assert.Equivalent(new[] { "key1", "key2", "key3" }, actual.Keys);
-        Assert.Equivalent(new[] { "a", "b" }, actual["key1"]);
-        Assert.Equivalent(new[] { "c" }, actual["key2"]);
-        Assert.Equivalent(new[] { "d", "e", "f" }, actual["key3"]);
+        Assert.Equal(expected.Count, actual.Count);
+        Assert.Equivalent(expected.Keys, actual.Keys);
+        Assert.Equal(expected["key1"], actual["key1"]);
+        Assert.Equal(expected["key2"], actual["key2"]);
+        Assert.Equal(expected["key3"], actual["key3"]);
     }
 
     [Fact]
@@ -255,10 +224,10 @@ public class DurableSetLookupTests(TestFixture fixture)
     {
         var grain = GetGrain("restore");
 
-        const int NumKeys = 100;
-        const int NumItemsPerKey = 10;
+        const int NumKeys = 50;
+        const int NumItemsPerKey = 20;
 
-        var expected = new Dictionary<string, HashSet<string>>();
+        var expected = new Dictionary<string, List<string>>();
 
         // We add a large number of items to ensure the state machine's logic
         // will trigger a snapshot operation upon deactivation.
@@ -266,7 +235,7 @@ public class DurableSetLookupTests(TestFixture fixture)
         for (int i = 0; i < NumKeys; i++)
         {
             var key = $"key{i}";
-            var values = new HashSet<string>();
+            var values = new List<string>();
 
             for (int j = 0; j < NumItemsPerKey; j++)
             {
@@ -286,7 +255,7 @@ public class DurableSetLookupTests(TestFixture fixture)
 
         foreach (var key in expected.Keys)
         {
-            Assert.Equivalent(expected[key], actualAfterRestore[key]);
+            Assert.Equal(expected[key], actualAfterRestore[key]);
         }
     }
 }

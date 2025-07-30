@@ -16,7 +16,8 @@ public class DurableListLookupTests(TestFixture fixture)
         Task<ReadOnlyCollection<string>> GetValues(string key);
         Task<ReadOnlyCollection<string>> GetKeys();
         Task<int> GetCount();
-        Task<bool> Contains(string key);
+        Task<bool> ContainsKey(string key);
+        Task<bool> ContainsItem(string key, string value);
         Task<Dictionary<string, List<string>>> GetAll();
     }
 
@@ -65,7 +66,9 @@ public class DurableListLookupTests(TestFixture fixture)
 
         public Task<int> GetCount() => Task.FromResult(state.Count);
 
-        public Task<bool> Contains(string key) => Task.FromResult(state.Contains(key));
+        public Task<bool> ContainsKey(string key) => Task.FromResult(state.Contains(key));
+
+        public Task<bool> ContainsItem(string key, string value) => Task.FromResult(state.Contains(key, value));
 
         public Task<Dictionary<string, List<string>>> GetAll()
         {
@@ -83,7 +86,7 @@ public class DurableListLookupTests(TestFixture fixture)
         var grain = GetGrain("empty");
 
         Assert.Equal(0, await grain.GetCount());
-        Assert.False(await grain.Contains("nonexistent"));
+        Assert.False(await grain.ContainsKey("nonexistent"));
 
         var values = await grain.GetValues("nonexistent");
         Assert.Empty(values);
@@ -102,11 +105,14 @@ public class DurableListLookupTests(TestFixture fixture)
 
         await grain.Add("key1", "val1_1");
         Assert.Equal(1, await grain.GetCount());
-        Assert.True(await grain.Contains("key1"));
+        Assert.True(await grain.ContainsKey("key1"));
+        Assert.True(await grain.ContainsItem("key1", "val1_1"));
+        Assert.False(await grain.ContainsItem("key1", "nonexistent"));
         Assert.Equal(["val1_1"], await grain.GetValues("key1"));
 
         await grain.Add("key1", "val1_2");
         Assert.Equal(1, await grain.GetCount());
+        Assert.True(await grain.ContainsItem("key1", "val1_2"));
         Assert.Equal(["val1_1", "val1_2"], await grain.GetValues("key1"));
 
         await grain.Add("key2", "val2_1");
@@ -115,16 +121,17 @@ public class DurableListLookupTests(TestFixture fixture)
 
         var removedItem = await grain.RemoveItem("key1", "val1_1");
         Assert.True(removedItem);
+        Assert.False(await grain.ContainsItem("key1", "val1_1"));
         Assert.Equal(["val1_2"], await grain.GetValues("key1"));
 
         var removedKey = await grain.RemoveKey("key2");
         Assert.True(removedKey);
         Assert.Equal(1, await grain.GetCount());
-        Assert.False(await grain.Contains("key2"));
+        Assert.False(await grain.ContainsKey("key2"));
 
         await grain.RemoveItem("key1", "val1_2");
         Assert.Equal(0, await grain.GetCount());
-        Assert.False(await grain.Contains("key1"));
+        Assert.False(await grain.ContainsKey("key1"));
     }
 
     [Fact]
@@ -171,9 +178,9 @@ public class DurableListLookupTests(TestFixture fixture)
         Assert.True(await grain.RemoveKey("key2"));
         Assert.Equal(2, await grain.GetCount());
 
-        Assert.True(await grain.Contains("key1"));
-        Assert.False(await grain.Contains("key2"));
-        Assert.True(await grain.Contains("key3"));
+        Assert.True(await grain.ContainsKey("key1"));
+        Assert.False(await grain.ContainsKey("key2"));
+        Assert.True(await grain.ContainsKey("key3"));
 
         Assert.Equal(["a", "b"], await grain.GetValues("key1"));
         Assert.Empty(await grain.GetValues("key2"));
@@ -203,7 +210,7 @@ public class DurableListLookupTests(TestFixture fixture)
         Assert.True(await grain.RemoveItem("key1", "b"));
 
         // When the last item is removed, the key should also be removed.
-        Assert.False(await grain.Contains("key1"));
+        Assert.False(await grain.ContainsKey("key1"));
         Assert.Equal(0, await grain.GetCount());
     }
 

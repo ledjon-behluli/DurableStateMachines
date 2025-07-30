@@ -27,6 +27,8 @@ public static class HostingExtensions
         services.TryAddKeyedScoped(typeof(IDurableGraph<,>), KeyedService.AnyKey, typeof(DurableGraph<,>));
         services.TryAddKeyedScoped(typeof(IDurableCancellationTokenSource), KeyedService.AnyKey, typeof(DurableCancellationTokenSource));
         services.TryAddKeyedScoped(typeof(IDurableObject<>), KeyedService.AnyKey, typeof(DurableObject<>));
+        services.TryAddKeyedScoped(typeof(IDurableOrderedSet<>), KeyedService.AnyKey, typeof(DurableOrderedSet<>));
+        services.TryAddKeyedScoped(typeof(IDurableOrderedSetLookup<,>), KeyedService.AnyKey, typeof(DurableOrderedSetLookup<,>));
 
         return services;
     }

@@ -9,12 +9,14 @@ using System.Runtime.CompilerServices;
 namespace Ledjon.DurableStateMachines;
 
 /// <summary>
-/// Defines a durable, one-to-many dictionary-like collection where each key maps to a unique set of values.
+/// Defines a durable, one-to-many dictionary-like collection where each key maps to an ordered, unique set of values.
 /// </summary>
 /// <typeparam name="TKey">The type of the keys in the lookup.</typeparam>
 /// <typeparam name="TValue">The type of the values in the lookup.</typeparam>
-/// <remarks>This collection does not allow duplicate values for a given key.</remarks>
-public interface IDurableSetLookup<TKey, TValue> :
+/// <remarks>
+/// This collection guarantees uniqueness and maintains insertion order for values associated with a given key.
+/// </remarks>
+public interface IDurableOrderedSetLookup<TKey, TValue> :
     IEnumerable<(TKey, IReadOnlyCollection<TValue>)>,
     IReadOnlyCollection<(TKey, IReadOnlyCollection<TValue>)>
         where TKey : notnull
@@ -25,7 +27,7 @@ public interface IDurableSetLookup<TKey, TValue> :
     IReadOnlyCollection<TKey> Keys { get; }
 
     /// <summary>
-    /// Gets a read-only collection of values associated with the specified key.
+    /// Gets a read-only collection of values associated with the specified key, in the order they were added.
     /// </summary>
     /// <param name="key">The key of the values to get.</param>
     /// <returns>A read-only collection of values for the specified key. If the key is not found, an empty collection is returned.</returns>
@@ -35,7 +37,7 @@ public interface IDurableSetLookup<TKey, TValue> :
     /// Determines whether the lookup contains the specified key.
     /// </summary>
     /// <param name="key">The key to locate in the lookup.</param>
-    /// <returns><c>true</c> if the lookup contains a key that matches the specified key; otherwise, <c>false</c>.</returns>
+    /// <returns><c>true</c> if the lookup contains an entry for the specified key; otherwise, <c>false</c>.</returns>
     bool Contains(TKey key);
 
     /// <summary>
@@ -47,7 +49,7 @@ public interface IDurableSetLookup<TKey, TValue> :
     bool Contains(TKey key, TValue value);
 
     /// <summary>
-    /// Adds the specified value to the set associated with the specified key.
+    /// Adds the specified value to the ordered set associated with the specified key.
     /// </summary>
     /// <param name="key">The key of the set to add the value to.</param>
     /// <param name="value">The value to add.</param>
@@ -62,7 +64,7 @@ public interface IDurableSetLookup<TKey, TValue> :
     bool Remove(TKey key);
 
     /// <summary>
-    /// Removes the specified value from the set associated with the specified key.
+    /// Removes the specified value from the ordered set associated with the specified key.
     /// If the set becomes empty after removal, the key is also removed from the lookup.
     /// </summary>
     /// <param name="key">The key of the set to remove the value from.</param>
@@ -77,8 +79,8 @@ public interface IDurableSetLookup<TKey, TValue> :
 }
 
 [DebuggerDisplay("Count = {Count}")]
-[DebuggerTypeProxy(typeof(DurableSetLookupDebugView<,>))]
-internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, TValue>, IDurableStateMachine 
+[DebuggerTypeProxy(typeof(DurableOrderedSetLookupDebugView<,>))]
+internal sealed class DurableOrderedSetLookup<TKey, TValue> : IDurableOrderedSetLookup<TKey, TValue>, IDurableStateMachine
     where TKey : notnull
 {
     private const byte VersionByte = 0;
@@ -88,9 +90,9 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
     private readonly SerializerSessionPool _sessionPool;
     private readonly IFieldCodec<TKey> _keyCodec;
     private readonly IFieldCodec<TValue> _valueCodec;
-    private readonly Dictionary<TKey, ValueSet> _items = [];
+    private readonly Dictionary<TKey, OrderedValueSet> _items = [];
 
-    public DurableSetLookup(
+    public DurableOrderedSetLookup(
         [ServiceKey] string key, IStateMachineManager manager,
         IFieldCodec<TKey> keyCodec, IFieldCodec<TValue> valueCodec,
         SerializerSessionPool sessionPool)
@@ -112,7 +114,7 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
         {
             if (!_items.TryGetValue(key, out var set) || set.Count == 0)
             {
-                return ImmutableArray<TValue>.Empty;
+                return ImmutableList<TValue>.Empty;
             }
 
             if (set.Count == 1)
@@ -120,7 +122,7 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
                 return [set.Single()];
             }
 
-            return [.. set];
+            return set.All();
         }
     }
 
@@ -144,11 +146,10 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
 
         if (version != VersionByte)
         {
-            throw new NotSupportedException($"This instance of {nameof(DurableSetLookup<TKey, TValue>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
+            throw new NotSupportedException($"This instance of {nameof(DurableOrderedSetLookup<TKey, TValue>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
         }
 
         var command = (CommandType)reader.ReadVarUInt32();
-
         switch (command)
         {
             case CommandType.Add: _ = ApplyAdd(ReadKey(ref reader), ReadValue(ref reader)); break;
@@ -176,16 +177,13 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
         void ApplySnapshot(ref Reader<ReadOnlySequenceInput> reader)
         {
             var keyCount = (int)reader.ReadVarUInt32();
-
             ApplyClear();
-            
-            _items.EnsureCapacity(keyCount);
 
+            _items.EnsureCapacity(keyCount);
             for (var i = 0; i < keyCount; i++)
             {
                 var key = ReadKey(ref reader);
                 var valueCount = (int)reader.ReadVarUInt32();
-
                 for (var j = 0; j < valueCount; j++)
                 {
                     _ = ApplyAdd(key, ReadValue(ref reader));
@@ -216,12 +214,12 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
                     self._valueCodec.WriteField(ref writer, 1, typeof(TValue), value);
                 }
             }
-
             writer.Commit();
         }, this);
     }
 
     public bool Contains(TKey key) => _items.ContainsKey(key);
+
     public bool Contains(TKey key, TValue value) => _items.TryGetValue(key, out var set) && set.Contains(value);
 
     public bool Add(TKey key, TValue value)
@@ -233,21 +231,20 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
                 var (self, cmd, key, value) = state;
 
                 using var session = self._sessionPool.GetSession();
-
+                
                 var writer = Writer.Create(bufferWriter, session);
-
+                
                 writer.WriteByte(VersionByte);
                 writer.WriteVarUInt32((uint)cmd);
-
+                
                 self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
                 self._valueCodec.WriteField(ref writer, 1, typeof(TValue), value);
-
+                
                 writer.Commit();
             }, (this, CommandType.Add, key, value));
 
             return true;
         }
-
         return false;
     }
 
@@ -258,22 +255,21 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
             GetStorage().AppendEntry(static (state, bufferWriter) =>
             {
                 var (self, cmd, key) = state;
-
+                
                 using var session = self._sessionPool.GetSession();
-
+                
                 var writer = Writer.Create(bufferWriter, session);
-
+                
                 writer.WriteByte(VersionByte);
                 writer.WriteVarUInt32((uint)cmd);
-
+                
                 self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
-
+                
                 writer.Commit();
             }, (this, CommandType.RemoveKey, key));
 
             return true;
         }
-
         return false;
     }
 
@@ -284,23 +280,22 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
             GetStorage().AppendEntry(static (state, bufferWriter) =>
             {
                 var (self, cmd, key, value) = state;
-
+                
                 using var session = self._sessionPool.GetSession();
-
+                
                 var writer = Writer.Create(bufferWriter, session);
-
+                
                 writer.WriteByte(VersionByte);
                 writer.WriteVarUInt32((uint)cmd);
-
+                
                 self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
                 self._valueCodec.WriteField(ref writer, 1, typeof(TValue), value);
-
+                
                 writer.Commit();
             }, (this, CommandType.RemoveItem, key, value));
 
             return true;
         }
-
         return false;
     }
 
@@ -310,43 +305,35 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
         GetStorage().AppendEntry(static (state, bufferWriter) =>
         {
             var (self, cmd) = state;
-
+            
             using var session = self._sessionPool.GetSession();
-
+            
             var writer = Writer.Create(bufferWriter, session);
-
+            
             writer.WriteByte(VersionByte);
             writer.WriteVarUInt32((uint)cmd);
-
+            
             writer.Commit();
         }, (this, CommandType.Clear));
     }
 
     private bool ApplyAdd(TKey key, TValue value)
     {
-        ValueSet updated;
+        _items.TryGetValue(key, out var set);
 
-        if (_items.TryGetValue(key, out ValueSet set))
+        var updated = set.Add(value);
+        if (updated.Equals(set))
         {
-            updated = set.Add(value);
-            if (updated.Equals(set))
-            {
-                return false;
-            }
-        }
-        else
-        {
-            updated = new ValueSet(value);
+            return false;
         }
 
         _items[key] = updated;
-
         return true;
     }
 
     private bool ApplyRemoveItem(TKey key, TValue value)
     {
-        if (!_items.TryGetValue(key, out ValueSet set))
+        if (!_items.TryGetValue(key, out var set))
         {
             return false;
         }
@@ -400,31 +387,34 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
     }
 
     /// <summary>
-    /// Initializes a new <see cref="ValueSet"/> holding either a single value or,
-    /// once more than one element is added, an <see cref="ImmutableHashSet{TValue}"/>.
-    /// We use <see cref="ImmutableHashSet{TValue}"/> rather than <see cref="HashSet{TValue}"/> so that:
+    /// Initializes a new <see cref="OrderedValueSet"/> holding either a single value or, once more than one
+    /// element is added, a tuple containing an <see cref="ImmutableHashSet{TValue}"/> and an <see cref="ImmutableList{TValue}"/>.
+    /// This composite structure provides both uniqueness with efficient lookups and preservation of insertion order.
     /// <list type="bullet">
     /// <item>
-    /// Every mutation (Add/Insert/Remove) returns a fresh instance with structural sharing,
-    /// ensuring efficient O(log n) updates without copying the entire collection on each change.
+    /// Every mutation (Add/Remove) returns a fresh instance with structural sharing,
+    /// ensuring efficient O(log n) updates without copying the entire collection on each change.
     /// </item>
     /// <item>
     /// The state machine can safely snapshot and replay history without risking out‑of‑band
     /// mutations or shared mutable state.
     /// </item>
     /// <item>
-    /// We avoid unnecessary allocations for the very common single‐value case,
-    /// falling back to an <see cref="ImmutableHashSet{TValue}"/> only when needed.
+    /// We avoid unnecessary allocations for the very common single‐value case, falling back to the
+    /// collection tuple only when a second unique element is added.
     /// </item>
     /// </list>
     /// </summary>
-    private readonly struct ValueSet(object? value) : IEnumerable<TValue>
+    private readonly struct OrderedValueSet(object? value) : IEnumerable<TValue>
     {
         /// <summary>
-        /// Stores either a single value or an <see cref="ImmutableHashSet{TValue}"/>, we avoid allocating a collection
-        /// for keys that only have one value associated with them, which is very common.
+        /// Stores either a single value, or a tuple of (<see cref="ImmutableHashSet{TValue}"/>, <see cref="ImmutableList{TValue}"/>).
+        /// We avoid allocating a collection for keys that only have one value associated with them, which is very common.
         /// </summary>
-        private readonly object? _value = value;
+        internal readonly object? _value = value;
+
+        private static readonly (ImmutableHashSet<TValue> Set, ImmutableList<TValue> List) Empty =
+            (ImmutableHashSet<TValue>.Empty, ImmutableList<TValue>.Empty);
 
         public int Count
         {
@@ -435,12 +425,13 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
                     return 0;
                 }
 
-                if (_value is not ImmutableHashSet<TValue> set)
+                if (_value is not ValueTuple<ImmutableHashSet<TValue>, ImmutableList<TValue>> tuple)
                 {
                     return 1;
                 }
 
-                return set.Count;
+                Debug.Assert(tuple.Item1.Count == tuple.Item2.Count);
+                return tuple.Item1.Count;
             }
         }
 
@@ -452,81 +443,105 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
             }
 
             // If we have multiple items, we use the hash set for efficient lookup.
-            if (_value is ImmutableHashSet<TValue> set)
+            if (_value is ValueTuple<ImmutableHashSet<TValue>, ImmutableList<TValue>> tuple)
             {
-                return set.Contains(value);
+                return tuple.Item1.Contains(value);
             }
 
             // Otherwise, we are storing a single item.
             return EqualityComparer<TValue>.Default.Equals((TValue)_value, value);
         }
 
-        public ValueSet Add(TValue value)
+        public OrderedValueSet Add(TValue value)
         {
+            // If the set is empty, we store the new value directly.
             if (_value is null)
             {
-                // No existing value, we store it directly to avoid set allocation.
-                return new ValueSet(value);
+                return new OrderedValueSet(value);
             }
 
-            // Try to view the stored value as a set.
-            var set = _value as ImmutableHashSet<TValue>;
-
-            // If it is not a set, we must have exactly one item stored.
-            if (set is null)
+            // If we are already storing multiple items.
+            if (_value is ValueTuple<ImmutableHashSet<TValue>, ImmutableList<TValue>> tuple)
             {
-                // If the new value equals that single stored element, nothing changes.
-                if (ImmutableHashSet<TValue>.Empty.KeyComparer.Equals((TValue)_value, value))
+                // First we check for existence. If the value is already present, nothing changes.
+                if (tuple.Item1.Contains(value))
                 {
                     return this;
                 }
 
-                // Otherwise, we create a new set containing both the old and new items.
-                set = [(TValue)_value];
+                // Otherwise, we add the new value to both the set and the list.
+                return new OrderedValueSet((tuple.Item1.Add(value), tuple.Item2.Add(value)));
             }
 
-            return new ValueSet(set.Add(value));
+            // If we are storing a single item.
+            var singleValue = (TValue)_value;
+            if (EqualityComparer<TValue>.Default.Equals(singleValue, value))
+            {
+                // And it's the same as the new value, nothing changes.
+                return this;
+            }
+
+            // Otherwise, we upgrade from a single value to the collection tuple.
+
+            var newSet = Empty.Set.Add(singleValue).Add(value);
+            var newList = Empty.List.Add(singleValue).Add(value);
+
+            return new OrderedValueSet((newSet, newList));
         }
 
-        public ValueSet Remove(TValue value)
+        public OrderedValueSet Remove(TValue value)
         {
-            // If there's no value stored, there's nothing to remove.
+            // If the set is empty, there is nothing to remove.
             if (_value is null)
             {
                 return this;
             }
 
-            // Try to interpret the stored value as a set.
-            if (_value is not ImmutableHashSet<TValue> set)
+            // If we are storing multiple items.
+            if (_value is ValueTuple<ImmutableHashSet<TValue>, ImmutableList<TValue>> tuple)
             {
-                // We must be storing a single item.
-                if (Comparer.Equals((TValue)_value, value))
+                // And the value isn't in the set, nothing changes.
+                if (!tuple.Item1.Contains(value))
                 {
-                    // It matches the item to remove, so we clear the value entirely.
-                    return new ValueSet(null);
+                    return this;
                 }
 
-                // Otherwise, the item doesn't match and there's nothing to remove.
+                // Otherwise, remove the value from both collections.
+                var newSet = tuple.Item1.Remove(value);
+                var newList = tuple.Item2.Remove(value);
+
+                // If more than one item remains, we store the updated tuple.
+                if (newList.Count > 1)
+                {
+                    return new OrderedValueSet((newSet, newList));
+                }
+
+                // If exactly one item remains, we downgrade to the single-value optimization.
+                if (newList.Count == 1)
+                {
+                    return new OrderedValueSet(newList[0]);
+                }
+
+                // If the set is now empty, we return the default instance.
+                return default;
+            }
+
+            // If we are storing a single item.
+            var singleValue = (TValue)_value;
+            if (!EqualityComparer<TValue>.Default.Equals(singleValue, value))
+            {
+                // And it doesn't match the value to remove, nothing changes.
                 return this;
             }
 
-            // Remove the value from the set.
-            var newSet = set.Remove(value);
+            // Otherwise, the item matches, so we return an default.
+            return default;
+        }
 
-            // If the set is now empty, clear the stored value.
-            if (newSet.Count == 0)
-            {
-                return new ValueSet(null);
-            }
-
-            // If there's only one item left, simplify by storing the value directly.
-            if (newSet.Count == 1)
-            {
-                return new ValueSet(newSet.First());
-            }
-
-            // Otherwise, store the updated set.
-            return new ValueSet(newSet);
+        public ImmutableList<TValue> All()
+        {
+            Debug.Assert(_value != null);
+            return ((ValueTuple<ImmutableHashSet<TValue>, ImmutableList<TValue>>)_value).Item2;
         }
 
         public TValue Single()
@@ -535,23 +550,23 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
             return (TValue)_value;
         }
 
-        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-        IEnumerator<TValue> IEnumerable<TValue>.GetEnumerator() => GetEnumerator();
-
         public Enumerator GetEnumerator() => new(this);
 
-        public bool Equals(ValueSet other) => _value == other._value;
+        IEnumerator<TValue> IEnumerable<TValue>.GetEnumerator() => GetEnumerator();
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+        public bool Equals(OrderedValueSet other) => _value == other._value;
 
         public struct Enumerator : IEnumerator<TValue>
         {
             private int _count;
             [AllowNull] private readonly TValue _value;
-            private ImmutableHashSet<TValue>.Enumerator _enumerator;
+            private ImmutableList<TValue>.Enumerator _enumerator; 
 
             object? IEnumerator.Current => Current;
             public TValue Current => _count > 1 ? _enumerator.Current : _value;
 
-            internal Enumerator(ValueSet valueSet)
+            internal Enumerator(OrderedValueSet valueSet)
             {
                 if (valueSet._value is null)
                 {
@@ -561,11 +576,14 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
                 }
                 else
                 {
-                    if (valueSet._value is ImmutableHashSet<TValue> set)
+                    if (valueSet._value is ValueTuple<ImmutableHashSet<TValue>, ImmutableList<TValue>> tuple)
                     {
                         _value = default;
-                        _enumerator = set.GetEnumerator();
-                        _count = set.Count;
+                        _enumerator = tuple.Item2.GetEnumerator(); // We use the list enumerator since this needs to perserve order.
+
+                        Debug.Assert(tuple.Item1.Count == tuple.Item2.Count);
+
+                        _count = tuple.Item2.Count;
 
                         Debug.Assert(_count > 1);
                     }
@@ -575,13 +593,11 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
                         _enumerator = default;
                         _count = 1;
                     }
-
-                    Debug.Assert(_count == valueSet.Count);
                 }
             }
 
             readonly void IDisposable.Dispose() { }
-            void IEnumerator.Reset() => throw new NotImplementedException();
+            void IEnumerator.Reset() => throw new NotSupportedException();
 
             public bool MoveNext()
             {
@@ -602,7 +618,7 @@ internal sealed class DurableSetLookup<TKey, TValue> : IDurableSetLookup<TKey, T
     }
 }
 
-internal sealed class DurableSetLookupDebugView<TKey, TValue>(DurableSetLookup<TKey, TValue> lookup) where TKey : notnull
+internal sealed class DurableOrderedSetLookupDebugView<TKey, TValue>(DurableOrderedSetLookup<TKey, TValue> lookup) where TKey : notnull
 {
     [DebuggerBrowsable(DebuggerBrowsableState.RootHidden)]
     public DebugViewItem[] Items => lookup.Select(kvp => new DebugViewItem(kvp.Item1, kvp.Item2)).ToArray();

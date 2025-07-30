@@ -39,6 +39,14 @@ public interface IDurableListLookup<TKey, TValue> :
     bool Contains(TKey key);
 
     /// <summary>
+    /// Determines if a specific value exists for the given key.
+    /// </summary>
+    /// <param name="key">The key to look under.</param>
+    /// <param name="value">The value to locate.</param>
+    /// <returns><c>true</c> if the value is found for the given key; otherwise, <c>false</c>.</returns>
+    bool Contains(TKey key, TValue value);
+
+    /// <summary>
     /// Adds the specified value to the list associated with the specified key.
     /// Duplicate values are allowed.
     /// </summary>
@@ -77,8 +85,7 @@ public interface IDurableListLookup<TKey, TValue> :
 
 [DebuggerDisplay("Count = {Count}")]
 [DebuggerTypeProxy(typeof(DurableListLookupDebugView<,>))]
-internal sealed partial class DurableListLookup<TKey, TValue> :
-    IDurableListLookup<TKey, TValue>, IDurableStateMachine
+internal sealed class DurableListLookup<TKey, TValue> : IDurableListLookup<TKey, TValue>, IDurableStateMachine
     where TKey : notnull
 {
     private const byte VersionByte = 0;
@@ -222,6 +229,7 @@ internal sealed partial class DurableListLookup<TKey, TValue> :
     }
 
     public bool Contains(TKey key) => _items.ContainsKey(key);
+    public bool Contains(TKey key, TValue value) => _items.TryGetValue(key, out var list) && list.Contains(value);
 
     public void Add(TKey key, TValue value)
     {
@@ -433,6 +441,22 @@ internal sealed partial class DurableListLookup<TKey, TValue> :
             }
         }
 
+        public bool Contains(TValue value)
+        {
+            if (_value is null)
+            {
+                return false;
+            }
+
+            if (_value is ImmutableList<TValue> list)
+            {
+                return list.Contains(value);
+            }
+
+            // Otherwise, we are storing a single item.
+            return EqualityComparer<TValue>.Default.Equals((TValue)_value, value);
+        }
+
         public ValueList Add(TValue value)
         {
             if (_value is null)
@@ -501,17 +525,17 @@ internal sealed partial class DurableListLookup<TKey, TValue> :
         {
             private int _count;
             [AllowNull] private readonly TValue _value;
-            private ImmutableList<TValue>.Enumerator _values;
+            private ImmutableList<TValue>.Enumerator _enumerator;
 
             object? IEnumerator.Current => Current;
-            public TValue Current => _count > 1 ? _values.Current : _value;
+            public TValue Current => _count > 1 ? _enumerator.Current : _value;
 
-            public Enumerator(ValueList valueList)
+            internal Enumerator(ValueList valueList)
             {
                 if (valueList._value == null)
                 {
                     _value = default;
-                    _values = default;
+                    _enumerator = default;
                     _count = 0;
                 }
                 else
@@ -519,7 +543,7 @@ internal sealed partial class DurableListLookup<TKey, TValue> :
                     if (valueList._value is ImmutableList<TValue> list)
                     {
                         _value = default;
-                        _values = list.GetEnumerator();
+                        _enumerator = list.GetEnumerator();
                         _count = list.Count;
 
                         Debug.Assert(_count > 1);
@@ -527,7 +551,7 @@ internal sealed partial class DurableListLookup<TKey, TValue> :
                     else
                     {
                         _value = (TValue)valueList._value;
-                        _values = default;
+                        _enumerator = default;
                         _count = 1;
                     }
                 }
@@ -543,7 +567,7 @@ internal sealed partial class DurableListLookup<TKey, TValue> :
                     case 0: return false;
                     case 1: _count = 0; return true;
                     default:
-                        if (_values.MoveNext())
+                        if (_enumerator.MoveNext())
                         {
                             return true;
                         }
