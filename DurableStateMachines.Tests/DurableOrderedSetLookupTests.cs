@@ -241,6 +241,7 @@ public class DurableOrderedSetLookupTests(TestFixture fixture)
             {
                 var value = $"val{i}_{j}";
                 await grain.Add(key, value);
+
                 values.Add(value);
             }
 
@@ -250,6 +251,7 @@ public class DurableOrderedSetLookupTests(TestFixture fixture)
         await DeactivateGrain(grain); // To trigger a restore from the snapshot
 
         var actualAfterRestore = await grain.GetAll();
+
         Assert.Equal(NumKeys, await grain.GetCount());
         Assert.Equivalent(expected.Keys, actualAfterRestore.Keys);
 

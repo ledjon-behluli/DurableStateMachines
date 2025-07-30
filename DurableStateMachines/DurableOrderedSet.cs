@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
+using Newtonsoft.Json.Linq;
 using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
@@ -170,10 +171,11 @@ internal sealed class DurableOrderedSet<T> : IDurableOrderedSet<T>, IDurableStat
 
         if (version != VersionByte)
         {
-            throw new NotSupportedException($"Unsupported log version: {version}.");
+            throw new NotSupportedException($"This instance of {nameof(DurableOrderedSet<T>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
         }
 
         var command = (CommandType)reader.ReadVarUInt32();
+
         switch (command)
         {
             case CommandType.Add: ApplyAdd(ReadValue(ref reader)); break;

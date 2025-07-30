@@ -150,6 +150,7 @@ internal sealed class DurableOrderedSetLookup<TKey, TValue> : IDurableOrderedSet
         }
 
         var command = (CommandType)reader.ReadVarUInt32();
+
         switch (command)
         {
             case CommandType.Add: _ = ApplyAdd(ReadKey(ref reader), ReadValue(ref reader)); break;
@@ -180,10 +181,12 @@ internal sealed class DurableOrderedSetLookup<TKey, TValue> : IDurableOrderedSet
             ApplyClear();
 
             _items.EnsureCapacity(keyCount);
+
             for (var i = 0; i < keyCount; i++)
             {
                 var key = ReadKey(ref reader);
                 var valueCount = (int)reader.ReadVarUInt32();
+            
                 for (var j = 0; j < valueCount; j++)
                 {
                     _ = ApplyAdd(key, ReadValue(ref reader));
