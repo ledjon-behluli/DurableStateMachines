@@ -165,13 +165,9 @@ Using a durable dictionary with `HashSet<T>` means every change—like adding or
 
 ### `IDurableOrderedSetLookup<TKey, TValue>`
 
-A one-to-many collection that maps a key to a unique  **set**  of values that maintains  **insertion order**. 
+A one-to-many collection that maps a key to a **unique  set**  of values that maintains  **insertion order**. 
 
-**Useful for:**
-
--   Tracking user achievements or badges in the exact order they were earned.
--   Managing ordered, unique dependencies for a build system.
--   Storing timelines of unique events per entity (e.g.,  `lookup.Add(userId, "LoggedIn")`,  `lookup.Add(userId, "ViewedProduct")`).
+**Useful for:** Tracking user achievements in the exact order they were earned, managing ordered unique dependencies for a build system, storing timelines of unique events per entity.
 
 ```csharp
 // Track the unique products a user viewed, in order.
