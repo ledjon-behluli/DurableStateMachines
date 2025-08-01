@@ -100,6 +100,8 @@ A collection of unique items that preserves their original insertion order. It c
 
 **Useful for:** Tracking a sequence of unique events, processing queue for unique jobs.
 
+> ⚠️ Note that this is an **ordered** collection, not a **sorted** one.
+
 ```csharp
 // Add returns true if the item was new
 if (history.Add("user_logged_in"))
@@ -168,6 +170,8 @@ Using a durable dictionary with `HashSet<T>` means every change—like adding or
 A one-to-many collection that maps a key to a **unique  set**  of values that maintains  **insertion order**. 
 
 **Useful for:** Tracking user achievements in the exact order they were earned, managing ordered unique dependencies for a build system, storing timelines of unique events per entity.
+
+> ⚠️ Note that this is an **ordered** collection, not a **sorted** one.
 
 ```csharp
 // Track the unique products a user viewed, in order.
