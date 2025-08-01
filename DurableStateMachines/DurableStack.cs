@@ -26,10 +26,10 @@ public interface IDurableStack<T> : IEnumerable<T>, IReadOnlyCollection<T>
     bool Contains(T item);
 
     /// <summary>
-    /// Copies the stack to an existing one-dimensional array, starting at the specified array index.
+    /// Copies the stack to an existing array, starting at the specified array index.
     /// The elements are copied from top to bottom.
     /// </summary>
-    /// <param name="array">The destination one-dimensional array.</param>
+    /// <param name="array">The destination  array.</param>
     /// <param name="arrayIndex">The zero-based index in <paramref name="array"/> at which copying begins.</param>
     void CopyTo(T[] array, int arrayIndex);
 

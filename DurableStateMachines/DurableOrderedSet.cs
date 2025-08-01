@@ -1,8 +1,8 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
-using Newtonsoft.Json.Linq;
 using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -40,6 +40,28 @@ public interface IDurableOrderedSet<T> : IEnumerable<T>, IReadOnlyCollection<T>
     /// <param name="item">The element to remove.</param>
     /// <returns><c>true</c> if the element was successfully found and removed; otherwise, <c>false</c>.</returns>
     bool Remove(T item);
+
+    /// <summary>
+    /// Searches the set for a given value and returns the equal value it finds, if any.
+    /// </summary>
+    /// <param name="equalValue">The value to search for.</param>
+    /// <param name="actualValue">The value from the set that the search found, or the default value of <typeparamref name="T"/> when the search yielded no match.</param>
+    /// <returns>A value indicating whether the search was successful.</returns>
+    /// <remarks>
+    /// This can be useful when you want to reuse a previously stored reference instead of
+    /// a newly constructed one (so that more sharing of references can occur) or to look up
+    /// a value that has more complete data than the value you currently have, although their
+    /// comparer functions indicate they are equal.
+    /// </remarks>
+    bool TryGetValue(T equalValue, [MaybeNullWhen(false)] out T actualValue);
+
+    /// <summary>
+    /// Copies the set to an existing array, starting at the specified array index.
+    /// The elements copied preserve their original insertion order.
+    /// </summary>
+    /// <param name="array">The destination array.</param>
+    /// <param name="arrayIndex">The zero-based index in <paramref name="array"/> at which copying begins.</param>
+    void CopyTo(T[] array, int arrayIndex);
 
     /// <summary>
     /// Removes all elements from the set.
@@ -88,6 +110,10 @@ internal sealed class DurableOrderedSet<T> : IDurableOrderedSet<T>, IDurableStat
     public ReadOnlySpan<T> OrderedItems => CollectionsMarshal.AsSpan(_list);
 
     public bool Contains(T item) => _set.Contains(item);
+    public bool TryGetValue(T equalValue, [MaybeNullWhen(false)] out T actualValue) => _set.TryGetValue(equalValue, out actualValue);
+    
+    // We use the list's CopyTo in order to preserve the order when the elements are copied to the destination array.
+    public void CopyTo(T[] array, int arrayIndex) => _list.CopyTo(array, arrayIndex);
 
     public bool Add(T item)
     {

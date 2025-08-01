@@ -14,6 +14,8 @@ public class DurableOrderedSetTests(TestFixture fixture)
         Task Clear();
         Task<List<string>> GetAll();
         Task<string[]> GetOrderedItemsAsArray();
+        Task<(bool Found, string? ActualValue)> TryGetValue(string value);
+        Task<string[]> CopyToArray(int arraySize, int arrayIndex);
     }
 
     public class DurableOrderedSetGrain([FromKeyedServices("ordered_set")]
@@ -55,6 +57,20 @@ public class DurableOrderedSetTests(TestFixture fixture)
 
         public Task<List<string>> GetAll() => Task.FromResult(state.ToList());
         public Task<string[]> GetOrderedItemsAsArray() => Task.FromResult(state.OrderedItems.ToArray());
+
+        public Task<(bool Found, string? ActualValue)> TryGetValue(string value)
+        {
+            var found = state.TryGetValue(value, out var actualValue);
+            return Task.FromResult((found, actualValue));
+        }
+
+        public Task<string[]> CopyToArray(int arraySize, int arrayIndex)
+        {
+            var array = new string[arraySize];
+            state.CopyTo(array, arrayIndex);
+
+            return Task.FromResult(array);
+        }
     }
 
     private IDurableOrderedSetGrain GetGrain(string key) => fixture.Cluster.Client.GetGrain<IDurableOrderedSetGrain>(key);
@@ -122,6 +138,54 @@ public class DurableOrderedSetTests(TestFixture fixture)
 
         await grain.Clear();
         Assert.Empty(await grain.GetOrderedItemsAsArray());
+    }
+
+    [Fact]
+    public async Task TryGetValue()
+    {
+        var grain = GetGrain("try-get-value");
+
+        var (foundEmpty, valueEmpty) = await grain.TryGetValue("anything");
+        Assert.False(foundEmpty);
+        Assert.Null(valueEmpty);
+
+        await grain.Add("one");
+        await grain.Add("two");
+
+        var (foundExisting, valueExisting) = await grain.TryGetValue("one");
+        Assert.True(foundExisting);
+        Assert.Equal("one", valueExisting);
+
+        var (foundMissing, valueMissing) = await grain.TryGetValue("three");
+        Assert.False(foundMissing);
+        Assert.Null(valueMissing);
+    }
+
+    [Fact]
+    public async Task CopyTo()
+    {
+        var grain = GetGrain("copy-to");
+        var items = new[] { "a", "b", "c" };
+        foreach (var item in items)
+        {
+            await grain.Add(item);
+        }
+
+        var destination1 = await grain.CopyToArray(3, 0);
+        Assert.Equal(items, destination1);
+
+        var destination2 = await grain.CopyToArray(5, 0);
+        Assert.Equal(new[] { "a", "b", "c", null, null }, destination2);
+
+        var destination3 = await grain.CopyToArray(5, 2);
+        Assert.Equal(new[] { null, null, "a", "b", "c" }, destination3);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => grain.CopyToArray(2, 0));
+        await Assert.ThrowsAsync<ArgumentException>(() => grain.CopyToArray(4, 2));
+
+        await grain.Clear();
+        var destination4 = await grain.CopyToArray(5, 0);
+        Assert.Equal(new string[5], destination4);
     }
 
     [Fact]

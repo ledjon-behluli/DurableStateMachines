@@ -15,6 +15,8 @@ public class DurableStackTests(TestFixture fixture)
         Task<int> GetCount();
         Task Clear();
         Task<List<string>> GetAll();
+        Task<bool> Contains(string value);
+        Task<string[]> CopyToArray(int arraySize, int arrayIndex);
     }
 
     public class DurableStackGrain([FromKeyedServices("stack")] 
@@ -61,6 +63,16 @@ public class DurableStackTests(TestFixture fixture)
         }
 
         public Task<List<string>> GetAll() => Task.FromResult(state.ToList());
+
+        public Task<bool> Contains(string value) => Task.FromResult(state.Contains(value));
+
+        public Task<string[]> CopyToArray(int arraySize, int arrayIndex)
+        {
+            var array = new string[arraySize];
+            state.CopyTo(array, arrayIndex);
+
+            return Task.FromResult(array);
+        }
     }
 
     private IDurableStackGrain GetGrain(string key) => fixture.Cluster.Client.GetGrain<IDurableStackGrain>(key);
@@ -115,6 +127,55 @@ public class DurableStackTests(TestFixture fixture)
         var emptyTryPop = await grain.TryPop();
         Assert.False(emptyTryPop.Result);
         Assert.Null(emptyTryPop.Item);
+    }
+
+    [Fact]
+    public async Task Contains()
+    {
+        var grain = GetGrain("contains");
+
+        Assert.False(await grain.Contains("anything"));
+
+        await grain.Push("one");
+        await grain.Push("two");
+        await grain.Push("three");
+
+        Assert.True(await grain.Contains("one"));
+        Assert.True(await grain.Contains("two"));
+        Assert.True(await grain.Contains("three"));
+        Assert.False(await grain.Contains("four"));
+
+        await grain.Pop();
+        Assert.False(await grain.Contains("three"));
+        Assert.True(await grain.Contains("two"));
+    }
+
+    [Fact]
+    public async Task CopyTo()
+    {
+        var grain = GetGrain("copy-to");
+
+        await grain.Push("c");
+        await grain.Push("b");
+        await grain.Push("a");
+
+        var expectedItems = new[] { "a", "b", "c" };
+
+        var destination1 = await grain.CopyToArray(3, 0);
+        Assert.Equal(expectedItems, destination1);
+
+        var destination2 = await grain.CopyToArray(5, 0);
+        Assert.Equal(new[] { "a", "b", "c", null, null }, destination2);
+
+        var destination3 = await grain.CopyToArray(5, 2);
+        Assert.Equal(new[] { null, null, "a", "b", "c" }, destination3);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => grain.CopyToArray(2, 0));
+        await Assert.ThrowsAsync<ArgumentException>(() => grain.CopyToArray(4, 2));
+
+        await grain.Clear();
+        var destination4 = await grain.CopyToArray(5, 0);
+        Assert.Equal(new string[5], destination4);
     }
 
     [Fact]
