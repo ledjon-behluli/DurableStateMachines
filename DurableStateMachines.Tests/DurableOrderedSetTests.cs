@@ -14,7 +14,7 @@ public class DurableOrderedSetTests(TestFixture fixture)
         Task Clear();
         Task<List<string>> GetAll();
         Task<string[]> GetOrderedItemsAsArray();
-        Task<(bool Found, string? ActualValue)> TryGetValue(string value);
+        Task<TryValue<string>> TryGetValue(string value);
         Task<string[]> CopyToArray(int arraySize, int arrayIndex);
     }
 
@@ -58,10 +58,10 @@ public class DurableOrderedSetTests(TestFixture fixture)
         public Task<List<string>> GetAll() => Task.FromResult(state.ToList());
         public Task<string[]> GetOrderedItemsAsArray() => Task.FromResult(state.OrderedItems.ToArray());
 
-        public Task<(bool Found, string? ActualValue)> TryGetValue(string value)
+        public Task<TryValue<string>> TryGetValue(string value)
         {
             var found = state.TryGetValue(value, out var actualValue);
-            return Task.FromResult((found, actualValue));
+            return Task.FromResult<TryValue<string>>(new(found, actualValue));
         }
 
         public Task<string[]> CopyToArray(int arraySize, int arrayIndex)
