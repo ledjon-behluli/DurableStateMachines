@@ -417,6 +417,7 @@ A durable, fixed-size circular buffer (or queue) that stores the last N items. W
 
 ```csharp
 // The buffer is created with a default capacity of 1.
+
 buffer.SetCapacity(3);
 await WriteStateAsync();
 
