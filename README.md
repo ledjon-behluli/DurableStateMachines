@@ -56,6 +56,8 @@ public class JobSchedulerGrain(
 * [Graph](#idurablegraphtnode-tedge)
 * [Cancellation Token Source](#idurablecancellationtokensource)
 * [Object](#idurableobjectt)
+* [Ring Buffer](#idurableringbuffert)
+* [Ring Buffer Collection](#idurableringbuffercollectiontkey-tvalue)
 
 ---
 
@@ -391,6 +393,96 @@ By disallowing  `null`,  `IDurableObject<T>`  ensures that you can always safely
 #### Why no  `Etag`?
 
 An `Etag` is a token used to detect race conditions where multiple processes might update the same record. This component doesn't need one because Orleans ensures only a single grain activation is the "writer," and all changes are appended to an immutable log using a custom binary protocol. Any process attempting to write to the log outside the state machine would corrupt the state, making external updates inherently not feasible, and even unsafe.
+
+---
+
+### `IDurableRingBuffer<T>`
+
+A durable, fixed-size circular buffer (or queue) that stores the last N items. When the buffer is full, adding a new item overwrites the oldest one.
+
+**Useful for:**
+
+-   Storing the last N log messages or telemetry data points.
+-   Keeping a history of recent, non-critical user actions for display.
+-   Managing data streams where only the most recent information is relevant.
+
+#### Key Concepts
+-   **Initial Capacity:**  Upon its initial creation, a ring buffer has a default capacity of   **1**. You must explicitly call  `SetCapacity(int)`  to configure it to your desired size.
+
+-   **Ordering & Overwriting:**  The buffer behaves like a standard queue, so **FIFO**. Its unique feature is that enqueuing an item into a full buffer succeeds by removing the **oldest** item to make space.
+
+-   **Dynamic Capacity:**  While it's a "fixed-size" buffer in concept, you can *durably* change its size at any time with  `SetCapacity(int)`. 
+
+> ⚠️ Note that **shrinking** the capacity will **discard** `C1 - C2` of the **oldest** items. Where `C1` is the previous capacity, and `C2` is the new capacity.
+
+```csharp
+// The buffer is created with a default capacity of 1.
+buffer.SetCapacity(3);
+await WriteStateAsync();
+
+buffer.Enqueue("A"); // Contains: [A]
+buffer.Enqueue("B"); // Contains: [A, B]
+buffer.Enqueue("C"); // Contains: [A, B, C] -> IsFull = true
+
+// This will overwrite the oldest item, "A".
+buffer.Enqueue("D"); // Contains: [B, C, D]
+await WriteStateAsync();
+
+if (buffer.TryDequeue(out var item)) // item is "B"
+{
+    // Do something with 'item'.
+    await WriteStateAsync();
+}
+```
+
+---
+
+### `IDurableRingBufferCollection<TKey, TValue>`
+
+A one-to-many collection that maps a key to an independent `IDurableRingBuffer<T>`, managed under a single state machine.
+
+**Useful for:**
+
+-   Tracking the last N events  _per-user_  or  _per-device_.
+-   Managing recent activity feeds for multiple entities (e.g., last 10 comments on multiple blog posts).
+-   Storing recent log messages partitioned  _by category_.
+
+#### Key Concepts
+
+-   **Initial Capacity:**  The  `capacity`  parameter in  `GetOrCreate(key, capacity)`  is  **only**  used when a buffer for that  `key`  is being created for the first time. On subsequent calls for an existing buffer, this parameter is ignored, preserving the buffer's current capacity.
+
+-   **Implicit Creation:**  Buffers are created automatically the first time a key is accessed via  `GetOrCreate(key, capacity)`. You don't need to check if a buffer exists before using it (*although you can*).
+
+
+-   **Isolation:**  Each ring buffer in the collection is completely independent. Operations on one buffer (like  `Enqueue`  or  `SetCapacity`) have no effect on any other buffer.
+
+-   **Fine-Grained Durability:**  This component is optimized for performance. An operation on a single buffer results in a small, specific log entry, rather than re-serializing an entire dictionary of buffers.
+
+```csharp
+// Get a buffer for "user1". 
+// Since it's new, it will be created with a capacity of 10.
+
+var buffer1 = collection.GetOrCreate("user1", 10);
+buffer1.Enqueue("Logged In");
+buffer1.Enqueue("Viewed Dashboard");
+
+// Get a buffer for another user. It is isolated from the above!
+var buffer2 = collection.GetOrCreate("user2", 5);
+buffer2.Enqueue("Viewed Product Page");
+
+// Because the buffer for "user1" already exists,
+// the capacity parameter (15) is ignored here,
+// and its current capacity (10) is preserved. The same
+// buffer instance is also returned!
+
+var buffer3 = collection.GetOrCreate("user1", 15);
+Console.WriteLine(ReferenceEquals(buffer1, buffer3)); // True
+Console.WriteLine(buffer3.Capacity == 10); // True
+buffer3.Enqueue("Updated Profile");
+
+// Durably store all changes in one go!
+await WriteStateAsync();
+```
 
 ---
 
