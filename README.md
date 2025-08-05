@@ -407,6 +407,7 @@ A durable, fixed-size circular buffer (or queue) that stores the last N items. W
 -   Managing data streams where only the most recent information is relevant.
 
 #### Key Concepts
+
 -   **Initial Capacity:**  Upon its initial creation, a ring buffer has a default capacity of   **1**. You must explicitly call  `SetCapacity(int)`  to configure it to your desired size.
 
 -   **Ordering & Overwriting:**  The buffer behaves like a standard queue, so **FIFO**. Its unique feature is that enqueuing an item into a full buffer succeeds by removing the **oldest** item to make space.
@@ -445,43 +446,42 @@ A one-to-many collection that maps a key to an independent `IDurableRingBuffer<T
 **Useful for:**
 
 -   Tracking the last N events  _per-user_  or  _per-device_.
--   Managing recent activity feeds for multiple entities (e.g., last 10 comments on multiple blog posts).
+-   Managing recent activity feeds for multiple entities (*e.g., last 10 comments on multiple blog posts*).
 -   Storing recent log messages partitioned  _by category_.
 
 #### Key Concepts
 
--   **Initial Capacity:**  The  `capacity`  parameter in  `GetOrCreate(key, capacity)`  is  **only**  used when a buffer for that  `key`  is being created for the first time. On subsequent calls for an existing buffer, this parameter is ignored, preserving the buffer's current capacity.
+- **Implicit Creation**: Buffers are created automatically the first time a key is accessed via `EnsureBuffer(key, capacity)`. You don't need to check if a buffer exists before using it (*although you can*).
 
--   **Implicit Creation:**  Buffers are created automatically the first time a key is accessed via  `GetOrCreate(key, capacity)`. You don't need to check if a buffer exists before using it (*although you can*).
+- **Ensured Capacity**: The capacity parameter in *EnsureBuffer(key, capacity)* is always enforced. When a buffer is created for the first time, it is set with this capacity. If a buffer for that key already exists, its capacity will be overwritten with the new value, which may result in data loss if the new capacity is smaller and the buffer had more items than the new capacity!
 
+- **Isolation**: Each ring buffer in the collection is completely independent. Operations on one buffer have no effect on any other buffer.
 
--   **Isolation:**  Each ring buffer in the collection is completely independent. Operations on one buffer (like  `Enqueue`  or  `SetCapacity`) have no effect on any other buffer.
-
--   **Fine-Grained Durability:**  This component is optimized for performance. An operation on a single buffer results in a small, specific log entry, rather than re-serializing an entire dictionary of buffers.
+- **Fine-Grained Persistence**: Any operation on a single buffer results in a small, specific log-entry, rather than re-serializing all buffers.
 
 ```csharp
-// Get a buffer for "user1". 
+// Get a buffer for "user1".
 // Since it's new, it will be created with a capacity of 10.
 
-var buffer1 = collection.GetOrCreate("user1", 10);
+var buffer1 = collection.EnsureBuffer("user1", 10);
 buffer1.Enqueue("Logged In");
 buffer1.Enqueue("Viewed Dashboard");
 
 // Get a buffer for another user. It is isolated from the above!
-var buffer2 = collection.GetOrCreate("user2", 5);
+var buffer2 = collection.EnsureBuffer("user2", 5);
 buffer2.Enqueue("Viewed Product Page");
 
-// Because the buffer for "user1" already exists,
-// the capacity parameter (15) is ignored here,
-// and its current capacity (10) is preserved. The same
-// buffer instance is also returned!
+// Because the buffer for "user1" already exists, calling EnsureBuffer
+// again will overwrite its capacity from 10 to 15.
+// The same buffer instance is returned.
 
-var buffer3 = collection.GetOrCreate("user1", 15);
+var buffer3 = collection.EnsureBuffer("user1", 15);
 Console.WriteLine(ReferenceEquals(buffer1, buffer3)); // True
-Console.WriteLine(buffer3.Capacity == 10); // True
+Console.WriteLine(buffer1.Capacity == 15); // True
+Console.WriteLine(buffer3.Capacity == 15); // True
 buffer3.Enqueue("Updated Profile");
 
-// Durably store all changes in one go!
+// Atomically persist all changes!
 await WriteStateAsync();
 ```
 
