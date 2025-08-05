@@ -369,6 +369,7 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
     private bool ApplyClearBuffer(TKey key) => GetOrCreateProxy(key).Buffer.Clear();
     private void ApplyClear() => _proxies.Clear();
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal RingBufferProxy GetOrCreateProxy(TKey key)
     {
         if (!_proxies.TryGetValue(key, out var proxy))
