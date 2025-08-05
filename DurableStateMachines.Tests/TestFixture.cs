@@ -5,6 +5,7 @@ global using Ledjon.DurableStateMachines;
 using System.Diagnostics.CodeAnalysis;
 using Microsoft.Extensions.DependencyInjection;
 using Orleans.TestingHost;
+using Microsoft.Extensions.Time.Testing;
 
 namespace DurableStateMachines.Tests;
 
@@ -19,7 +20,8 @@ public class GlobalFixture : ICollectionFixture<TestFixture>
 
 public class TestFixture : IAsyncLifetime
 {
-    public readonly InProcessTestCluster Cluster;
+    public FakeTimeProvider TimeProvider { get; } = new();
+    public InProcessTestCluster Cluster { get; }
 
     public TestFixture()
     {
@@ -28,6 +30,7 @@ public class TestFixture : IAsyncLifetime
         builder.ConfigureSilo((options, siloBuilder) =>
         {
             siloBuilder.AddStateMachineStorage();
+            siloBuilder.Services.AddSingleton<TimeProvider>(TimeProvider);
             siloBuilder.Services.AddSingleton<IStateMachineStorageProvider>(_ => new VolatileStateMachineStorageProvider());
             siloBuilder.Services.AddDurableStateMachines();
         });

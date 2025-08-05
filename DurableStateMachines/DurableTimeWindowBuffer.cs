@@ -1,23 +1,23 @@
-﻿using Microsoft.Extensions.DependencyInjection;
-using System.Buffers;
+﻿using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Ledjon.DurableStateMachines;
 
 /// <summary>
-/// Defines a durable, fixed-size circular buffer that stores the last N items in the order they were added.
-/// When the buffer reaches its capacity, adding a new item will overwrite the oldest one.
+/// Defines a durable buffer that stores items added within a specific time window.
+/// When new items are added, any items older than the specified time window are automatically discarded.
 /// </summary>
-/// <typeparam name="T">Specifies the type of elements in the ring buffer.</typeparam>
-public interface IDurableRingBuffer<T> : IEnumerable<T>, IReadOnlyCollection<T>
+/// <typeparam name="T">Specifies the type of elements in the buffer.</typeparam>
+public interface IDurableTimeWindowBuffer<T> : IEnumerable<T>, IReadOnlyCollection<T>
 {
     /// <summary>
-    /// Gets the maximum number of elements the buffer can hold.
+    /// Gets the duration that items are retained in the buffer.
     /// </summary>
-    int Capacity { get; }
+    TimeSpan Window { get; }
 
     /// <summary>
     /// Gets a value indicating whether the buffer is empty.
@@ -25,21 +25,16 @@ public interface IDurableRingBuffer<T> : IEnumerable<T>, IReadOnlyCollection<T>
     bool IsEmpty { get; }
 
     /// <summary>
-    /// Gets a value indicating whether the buffer is full.
+    /// Sets the time window for the buffer.
+    /// If the new window is smaller than the current one, older items may be discarded immediately.
     /// </summary>
-    bool IsFull { get; }
+    /// <param name="window">The desired new time window.</param>
+    /// <returns><c>true</c> if the time window is different from the provided <paramref name="window"/>, which in turn becomes the new window; otherwise, <c>false</c>.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown if time window is zero or negative.</exception>
+    bool SetWindow(TimeSpan window);
 
     /// <summary>
-    /// Sets the total capacity of the buffer. 
-    /// If the new capacity is smaller than the current number of items, the oldest items are discarded.
-    /// </summary>
-    /// <param name="capacity">The desired new capacity.</param>
-    /// <returns><c>true</c> if the internal capacity is different from <paramref name="capacity"/>, which in turn becomes the new capacity; otherwise, <c>false</c>.</returns>
-    /// <exception cref="ArgumentOutOfRangeException">Thrown if capacity is zero or negative.</exception>
-    bool SetCapacity(int capacity);
-
-    /// <summary>
-    /// Adds an item to the buffer. If the buffer is full, the oldest item is overwritten.
+    /// Adds an item to the buffer with the current timestamp. Any items older than the time window are removed.
     /// </summary>
     /// <param name="item">The item to add to the buffer.</param>
     void Enqueue(T item);
@@ -96,35 +91,36 @@ public interface IDurableRingBuffer<T> : IEnumerable<T>, IReadOnlyCollection<T>
     void Clear();
 }
 
-[DebuggerDisplay("Count = {Count}, Capacity = {Capacity}, IsEmpty = {IsEmpty}, IsFull = {IsFull}")]
-[DebuggerTypeProxy(typeof(DurableRingBufferDebugView<>))]
-internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStateMachine
+[DebuggerDisplay("Count = {Count}, IsEmpty = {IsEmpty}, Window = {Window}")]
+[DebuggerTypeProxy(typeof(DurableTimeWindowBufferDebugView<>))]
+internal sealed class DurableTimeWindowBuffer<T> : IDurableTimeWindowBuffer<T>, IDurableStateMachine
 {
     private const byte VersionByte = 0;
 
     private IStateMachineLogWriter? _storage;
 
-    private readonly RingBuffer<T> _buffer = new();
+    private readonly TimeWindowBuffer<T> _buffer = new();
     private readonly SerializerSessionPool _sessionPool;
+    private readonly TimeProvider _timeProvider;
     private readonly IFieldCodec<T> _codec;
 
-    public DurableRingBuffer(
+    public DurableTimeWindowBuffer(
         [ServiceKey] string key, IStateMachineManager manager,
-        IFieldCodec<T> codec, SerializerSessionPool sessionPool)
+        IFieldCodec<T> codec, SerializerSessionPool sessionPool, TimeProvider timeProvider)
     {
         ArgumentException.ThrowIfNullOrEmpty(key);
 
         _codec = codec;
         _sessionPool = sessionPool;
+        _timeProvider = timeProvider;
 
         manager.RegisterStateMachine(key, this);
     }
 
     public int Count => _buffer.Count;
-    public int Capacity => _buffer.Capacity;
     public bool IsEmpty => _buffer.IsEmpty;
-    public bool IsFull => _buffer.IsFull;
-    
+    public TimeSpan Window => TimeSpan.FromSeconds(_buffer.WindowSeconds);
+
     void IDurableStateMachine.AppendEntries(StateMachineStorageWriter writer)
     {
         // We use a push model, and append entries upon modification.
@@ -145,19 +141,19 @@ internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStat
 
         if (version != VersionByte)
         {
-            throw new NotSupportedException($"This instance of {nameof(DurableRingBuffer<T>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
+            throw new NotSupportedException($"This instance of {nameof(DurableTimeWindowBuffer<T>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
         }
 
         var command = (CommandType)reader.ReadVarUInt32();
 
         switch (command)
         {
-            case CommandType.SetCapacity: _ = ApplySetCapacity((int)reader.ReadVarUInt32()); break;
-            case CommandType.Enqueue: ApplyEnqueue(ReadValue(ref reader)); break;
+            case CommandType.SetWindow: _ = ApplySetWindow((long)reader.ReadVarUInt64()); break;
+            case CommandType.Enqueue: ApplyEnqueue(ReadValue(ref reader), (long)reader.ReadVarUInt64()); break;
             case CommandType.Dequeue: _ = ApplyTryDequeue(out _); break;
             case CommandType.Clear: _ = ApplyClear(); break;
             case CommandType.Snapshot: ApplySnapshot(ref reader); break;
-            default: throw new NotSupportedException($"Command type {command} is not supported");
+            default: throw new NotSupportedException($"Command type is not supported");
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -169,15 +165,17 @@ internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStat
 
         void ApplySnapshot(ref Reader<ReadOnlySequenceInput> reader)
         {
+            var windowSeconds = (long)reader.ReadVarUInt64();
             var count = (int)reader.ReadVarUInt32();
-            var capacity = (int)reader.ReadVarUInt32();
 
-            //  Since we support a dynamic capacity, we restore the buffer to the capacity it had when the snapshot was taken.   
-            ApplySetCapacity(capacity); // This implicitly resets the buffer to the correct size.
+            ApplySetWindow(windowSeconds);
 
             for (var i = 0; i < count; i++)
             {
-                ApplyEnqueue(ReadValue(ref reader));
+                var item = ReadValue(ref reader);
+                var timestamp = (long)reader.ReadVarUInt64();
+
+                ApplyEnqueue(item, timestamp);
             }
         }
     }
@@ -187,45 +185,48 @@ internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStat
         writer.AppendEntry(static (self, bufferWriter) =>
         {
             using var session = self._sessionPool.GetSession();
-            
+
             var writer = Writer.Create(bufferWriter, session);
 
             writer.WriteByte(VersionByte);
             writer.WriteVarUInt32((uint)CommandType.Snapshot);
-            
-            writer.WriteVarUInt32((uint)self.Count);
-            writer.WriteVarUInt32((uint)self.Capacity);
 
-            foreach (var item in self)
+            writer.WriteVarUInt64((ulong)self._buffer.WindowSeconds);
+            writer.WriteVarUInt32((uint)self.Count);
+
+            foreach (var (item, timestamp) in self._buffer.GetEntries())
             {
                 self._codec.WriteField(ref writer, 0, typeof(T), item);
+                writer.WriteVarUInt64((ulong)timestamp);
             }
 
             writer.Commit();
         }, this);
     }
 
-    public bool SetCapacity(int capacity)
+    public bool SetWindow(TimeSpan window)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity, nameof(capacity));
+        var windowSeconds = (long)window.TotalSeconds;
 
-        if (ApplySetCapacity(capacity))
+        TimeWindowBuffer<T>.ThrowIfTooShortWindow(windowSeconds);
+
+        if (ApplySetWindow(windowSeconds))
         {
             GetStorage().AppendEntry(static (state, bufferWriter) =>
             {
-                var (self, capacity) = state;
-               
+                var (self, windowSeconds) = state;
+
                 using var session = self._sessionPool.GetSession();
-                
+
                 var writer = Writer.Create(bufferWriter, session);
 
                 writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)CommandType.SetCapacity);
-                
-                writer.WriteVarUInt32((uint)capacity);
-                
+                writer.WriteVarUInt32((uint)CommandType.SetWindow);
+
+                writer.WriteVarUInt64((ulong)windowSeconds);
+
                 writer.Commit();
-            }, (this, capacity));
+            }, (this, windowSeconds));
 
             return true;
         }
@@ -235,22 +236,25 @@ internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStat
 
     public void Enqueue(T item)
     {
-        ApplyEnqueue(item);
+        var timestamp = _timeProvider.GetUtcNow().ToUnixTimeSeconds();
+
+        ApplyEnqueue(item, timestamp);
         GetStorage().AppendEntry(static (state, bufferWriter) =>
         {
-            var (self, item) = state;
+            var (self, item, timestamp) = state;
 
             using var session = self._sessionPool.GetSession();
-            
+
             var writer = Writer.Create(bufferWriter, session);
 
             writer.WriteByte(VersionByte);
             writer.WriteVarUInt32((uint)CommandType.Enqueue);
-            
+
             self._codec.WriteField(ref writer, 0, typeof(T), item);
-            
+            writer.WriteVarUInt64((ulong)timestamp);
+
             writer.Commit();
-        }, (this, item));
+        }, (this, item, timestamp));
     }
 
     public bool TryDequeue([MaybeNullWhen(false)] out T item)
@@ -260,6 +264,7 @@ internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStat
             GetStorage().AppendEntry(static (self, bufferWriter) =>
             {
                 using var session = self._sessionPool.GetSession();
+
                 var writer = Writer.Create(bufferWriter, session);
 
                 writer.WriteByte(VersionByte);
@@ -311,8 +316,8 @@ internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStat
         return count;
     }
 
-    private bool ApplySetCapacity(int capacity) => _buffer.SetCapacity(capacity);
-    private void ApplyEnqueue(T item) => _buffer.Enqueue(item);
+    private bool ApplySetWindow(long windowSeconds) => _buffer.SetWindow(windowSeconds, _timeProvider.GetUtcNow().ToUnixTimeSeconds());
+    private void ApplyEnqueue(T item, long timestamp) => _buffer.Enqueue(item, timestamp);
     private bool ApplyTryDequeue(out T item) => _buffer.TryDequeue(out item!);
     private bool ApplyClear() => _buffer.Clear();
 
@@ -331,115 +336,64 @@ internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStat
     {
         Clear = 0,
         Snapshot = 1,
-        SetCapacity = 2,
+        SetWindow = 2,
         Enqueue = 3,
         Dequeue = 4
     }
 }
 
-internal sealed class DurableRingBufferDebugView<T>(DurableRingBuffer<T> buffer)
+internal sealed class DurableTimeWindowBufferDebugView<T>(DurableTimeWindowBuffer<T> buffer)
 {
     [DebuggerBrowsable(DebuggerBrowsableState.RootHidden)]
     public T[] Items => [.. buffer];
 }
 
-internal sealed class RingBuffer<T> : IEnumerable<T>
+internal sealed class TimeWindowBuffer<T> : IEnumerable<T>
 {
-    private int _head = 0;  // Points to the index where the next item will be written.
-    private int _tail = 0;  // Points to the index where the next item will be read.
-    private int _count = 0;
+    private readonly Queue<(T Item, long Timestamp)> _buffer = new();
 
-    private T[] _buffer = new T[1]; // Users are supposed to set their desired capacity!
+    public int Count => _buffer.Count;
+    public bool IsEmpty => _buffer.Count == 0;
+    public long WindowSeconds { get; private set; } = 60 * 60; // We default to 1 hour
 
-    public int Capacity => _buffer.Length;
-    public int Count => _count;
-    public bool IsEmpty => _count == 0;
-    public bool IsFull => _count == Capacity;
-
-    public void Enqueue(T item)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void ThrowIfTooShortWindow(long windowSeconds)
     {
-        _buffer[_head] = item;
-        _head = (_head + 1) % Capacity;
+        if (windowSeconds < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(windowSeconds), "Window must be at least 1 second.");
+        }
+    }
 
-        if (IsFull)
-        {
-            _tail = (_tail + 1) % Capacity; // This means that the head has overwritten the tail.
-        }
-        else
-        {
-            _count++;
-        }
+    public void Enqueue(T item, long timestamp)
+    {
+        _buffer.Enqueue((item, timestamp));
+        PurgeOldItems(timestamp);
     }
 
     public bool TryDequeue([MaybeNullWhen(false)] out T item)
     {
-        if (IsEmpty)
+        if (_buffer.TryDequeue(out var entry))
         {
-            item = default;
-            return false;
+            item = entry.Item;
+            return true;
         }
 
-        item = _buffer[_tail];
-
-        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-        {
-            _buffer[_tail] = default!; // To avoid a potential memory leak.
-        }
-
-        _tail = (_tail + 1) % Capacity;
-        _count--;
-
-        return true;
+        item = default;
+        return false;
     }
 
-    public bool SetCapacity(int capacity)
+    public bool SetWindow(long windowSeconds, long currentTimestamp)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity, nameof(capacity));
+        ThrowIfTooShortWindow(windowSeconds);
 
-        if (capacity == Capacity)
+        if (windowSeconds == WindowSeconds)
         {
             return false;
         }
 
-        var newBuffer = new T[capacity];
-        var itemsToKeep = Math.Min(_count, capacity);
-
-        if (itemsToKeep > 0)
-        {
-            // We calculate the start index of the newest items by skipping the oldest ones.
-
-            var oldestItemsToSkip = _count - itemsToKeep;
-            var startOfNewestItemsIndex = (_tail + oldestItemsToSkip) % Capacity;
-
-            var source = _buffer.AsSpan();
-            var destination = newBuffer.AsSpan();
-
-            if (startOfNewestItemsIndex < _head || _head == 0)
-            {
-                // The newest items are in a single contiguous block (in the old buffer).
-                source.Slice(startOfNewestItemsIndex, itemsToKeep).CopyTo(destination);
-            }
-            else
-            {
-                // The newest items are split into two segments.
-                // e.g., [4, 5, 1, 2, 3] where tail=2, head=2, count=5. 
-                // If we want to keep 3 items (3 , 4, 5), start index is (2 + 5 - 3) % 5 = 4.
-                // Items are at index 4, and then wraps to 0 and 1.
-
-                // First segment: from the calculated start to the end of the old buffer.
-                var rightSegmentLength = Capacity - startOfNewestItemsIndex;
-                source.Slice(startOfNewestItemsIndex, rightSegmentLength).CopyTo(destination);
-
-                // Second segment: from the beginning of the old buffer.
-                var leftSegmentLength = itemsToKeep - rightSegmentLength;
-                source.Slice(0, leftSegmentLength).CopyTo(destination.Slice(rightSegmentLength));
-            }
-        }
-
-        _buffer = newBuffer;
-        _count = itemsToKeep;
-        _tail = 0;
-        _head = (itemsToKeep == capacity) ? 0 : itemsToKeep;
+        WindowSeconds = windowSeconds;
+        PurgeOldItems(currentTimestamp);
 
         return true;
     }
@@ -452,100 +406,62 @@ internal sealed class RingBuffer<T> : IEnumerable<T>
 
     public int CopyTo(Span<T> destination)
     {
-        var count = Math.Min(destination.Length, _count);
+        var count = Math.Min(destination.Length, _buffer.Count);
         if (count == 0)
         {
             return 0;
         }
 
-        var source = new ReadOnlySpan<T>(_buffer);
-
-        // The items can be either in one contiguous or two disjoint segments.
-        if (_tail < _head)
+        int i = 0;
+        
+        foreach (var (item, _) in _buffer)
         {
-            // The items are in a contiguous segment: [_, _, T..H, _, _]
-            source.Slice(_tail, count).CopyTo(destination);
-        }
-        else
-        {
-            // The items are in two segments: [H.., _, ..T], in other words they are wrapped around the end.
-            var rightSegment = source.Slice(_tail, Capacity - _tail);
-            var leftSegment = source.Slice(0, _head);
+            if (i >= count)
+            {
+                break;
+            }
 
-            if (rightSegment.Length >= count)
-            {
-                rightSegment.Slice(0, count).CopyTo(destination);
-            }
-            else
-            {
-                rightSegment.CopyTo(destination);
-                leftSegment.Slice(0, count - rightSegment.Length).CopyTo(destination.Slice(rightSegment.Length));
-            }
+            destination[i++] = item;
         }
+
         return count;
     }
 
     public bool Clear()
     {
-        if (_count == 0)
+        if (_buffer.Count == 0)
         {
             return false;
         }
 
-        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-        {
-            // To avoid a potential memory leak, we clear the array, which should tell the
-            // GC we no longer are clinging to the references of the items we hold in the buffer.
-            // This is only valid for reference types or structs holding onto other reference types.
-
-            Array.Clear(_buffer, 0, Capacity);
-        }
-
-        _head = 0;
-        _tail = 0;
-        _count = 0;
+        _buffer.Clear();
 
         return true;
     }
 
-    public Enumerator GetEnumerator() => new(this);
-
-    IEnumerator<T> IEnumerable<T>.GetEnumerator() => GetEnumerator();
-    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-
-    public struct Enumerator(RingBuffer<T> buffer) : IEnumerator<T>
+    private void PurgeOldItems(long currentTimestamp)
     {
-        private int _index = -1;
-        [AllowNull] private T _current = default;
+        var evictionThreshold = currentTimestamp - WindowSeconds;
 
-        public readonly T Current => _current;
-        readonly object? IEnumerator.Current => Current;
-
-        readonly void IDisposable.Dispose() { }
-
-        public void Reset()
+        while (_buffer.TryPeek(out var entry) && entry.Timestamp < evictionThreshold)
         {
-            _index = -1;
-            _current = default;
-        }
-
-        public bool MoveNext()
-        {
-            if (buffer._buffer is null || _index >= buffer.Count - 1)
-            {
-                _index = buffer.Count;
-                _current = default;
-
-                return false;
-            }
-
-            _index++;
-
-            var actualIndex = (buffer._tail + _index) % buffer.Capacity;
-            
-            _current = buffer._buffer[actualIndex];
-
-            return true;
+            _buffer.Dequeue();
         }
     }
+
+    /// <summary>
+    /// Returns an enumerable of the raw entries, including timestamps.
+    /// </summary>
+    /// <remarks>Used for snapshotting.</remarks>
+    public IEnumerable<(T Item, long TimestampSeconds)> GetEntries() => _buffer;
+
+    public IEnumerator<T> GetEnumerator()
+    {
+        foreach (var (item, _) in _buffer)
+        {
+            yield return item;
+        }
+    }
+
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 }

@@ -3,13 +3,13 @@
 namespace DurableStateMachines.Tests;
 
 [Collection(GlobalFixture.Name)]
-public class DurableRingBufferCollectionTests(TestFixture fixture)
+public class DurableTimeWindowBufferCollectionTests(TestFixture fixture)
 {
-    public interface IDurableRingBufferCollectionGrain : IGrainWithStringKey
+    public interface IDurableTimeWindowBufferCollectionGrain : IGrainWithStringKey
     {
         // Workaround methods to survive deactivation
-        Task<Dictionary<string, int>> GetAllCapacities();
-        Task SetAllCapacities(Dictionary<string, int> capacities);
+        Task<Dictionary<string, TimeSpan>> GetAllWindows();
+        Task SetAllWindows(Dictionary<string, TimeSpan> windows);
 
         // Collection methods
         Task<int> GetBuffersCount();
@@ -21,34 +21,34 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
         // Buffer methods
         Task Enqueue(string key, string value);
         Task<TryValue<string?>> TryDequeue(string key);
-        Task SetBufferCapacity(string key, int capacity);
+        Task SetBufferWindow(string key, TimeSpan window);
         Task ClearBuffer(string key);
-        Task<int> GetBufferCapacity(string key);
+        Task<TimeSpan> GetBufferWindow(string key);
         Task<int> GetBufferItemsCount(string key);
         Task<List<string>> GetAllBufferItems(string key);
     }
 
-    public class DurableRingBufferCollectionGrain(
-        [FromKeyedServices("ring-buffer-collection")] IDurableRingBufferCollection<string, string> state)
-            : DurableGrain, IDurableRingBufferCollectionGrain
+    public class DurableTimeWindowBufferCollectionGrain(
+        [FromKeyedServices("time-window-buffer-collection")] IDurableTimeWindowBufferCollection<string, string> state)
+            : DurableGrain, IDurableTimeWindowBufferCollectionGrain
     {
-        private const int DefaultCapacity = 1;
-        private readonly Dictionary<string, int> _capacities = [];
+        private static readonly TimeSpan DefaultWindow = TimeSpan.FromHours(1);
+        private readonly Dictionary<string, TimeSpan> _windows = [];
 
-        private IDurableRingBuffer<string> GetBuffer(string key)
+        private IDurableTimeWindowBuffer<string> GetBuffer(string key)
         {
-            var capacity = _capacities.GetValueOrDefault(key, DefaultCapacity);
-            return state.EnsureBuffer(key, capacity);
+            var window = _windows.GetValueOrDefault(key, DefaultWindow);
+            return state.EnsureBuffer(key, window);
         }
 
-        public Task<Dictionary<string, int>> GetAllCapacities() => Task.FromResult(new Dictionary<string, int>(_capacities));
+        public Task<Dictionary<string, TimeSpan>> GetAllWindows() => Task.FromResult(new Dictionary<string, TimeSpan>(_windows));
 
-        public Task SetAllCapacities(Dictionary<string, int> capacities)
+        public Task SetAllWindows(Dictionary<string, TimeSpan> windows)
         {
-            _capacities.Clear();
-            foreach (var (key, value) in capacities)
+            _windows.Clear();
+            foreach (var (key, value) in windows)
             {
-                _capacities[key] = value;
+                _windows[key] = value;
             }
             return Task.CompletedTask;
         }
@@ -62,7 +62,7 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
             var removed = state.Remove(key);
             if (removed)
             {
-                _capacities.Remove(key);
+                _windows.Remove(key);
                 await WriteStateAsync();
             }
             return removed;
@@ -70,9 +70,8 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
 
         public async Task ClearAll()
         {
-            _capacities.Clear();
+            _windows.Clear();
             state.Clear();
-
             await WriteStateAsync();
         }
 
@@ -92,10 +91,10 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
             return new(success, item);
         }
 
-        public async Task SetBufferCapacity(string key, int capacity)
+        public async Task SetBufferWindow(string key, TimeSpan window)
         {
-            _capacities[key] = capacity;
-            GetBuffer(key); // This will use the now just set '_capacities[key]', as it does EnsureBuffer(key, capacity).
+            _windows[key] = window;
+            GetBuffer(key); // This uses EnsureBuffer, which sets the window in the durable state.
             await WriteStateAsync();
         }
 
@@ -105,13 +104,13 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
             await WriteStateAsync();
         }
 
-        public Task<int> GetBufferCapacity(string key) => Task.FromResult(GetBuffer(key).Capacity);
+        public Task<TimeSpan> GetBufferWindow(string key) => Task.FromResult(GetBuffer(key).Window);
         public Task<int> GetBufferItemsCount(string key) => Task.FromResult(GetBuffer(key).Count);
         public Task<List<string>> GetAllBufferItems(string key) => Task.FromResult(GetBuffer(key).ToList());
     }
 
-    private IDurableRingBufferCollectionGrain GetGrain(string key) => fixture.Cluster.Client.GetGrain<IDurableRingBufferCollectionGrain>(key);
-    private static ValueTask DeactivateGrain(IDurableRingBufferCollectionGrain grain) => grain.Cast<IGrainManagementExtension>().DeactivateOnIdle();
+    private IDurableTimeWindowBufferCollectionGrain GetGrain(string key) => fixture.Cluster.Client.GetGrain<IDurableTimeWindowBufferCollectionGrain>(key);
+    private static ValueTask DeactivateGrain(IDurableTimeWindowBufferCollectionGrain grain) => grain.Cast<IGrainManagementExtension>().DeactivateOnIdle();
 
     [Fact]
     public async Task BasicOperations()
@@ -120,12 +119,12 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
 
         Assert.Equal(0, await grain.GetBuffersCount());
 
-        await grain.SetBufferCapacity("A", 10);
+        await grain.SetBufferWindow("A", TimeSpan.FromMinutes(10));
         Assert.Equal(1, await grain.GetBuffersCount());
         Assert.True(await grain.ContainsBuffer("A"));
         Assert.Equal(["A"], await grain.GetKeys());
 
-        await grain.SetBufferCapacity("B", 5);
+        await grain.SetBufferWindow("B", TimeSpan.FromMinutes(5));
         Assert.Equal(2, await grain.GetBuffersCount());
         Assert.True(await grain.ContainsBuffer("B"));
 
@@ -146,23 +145,20 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
         var grain = GetGrain("ensure-buffer");
 
         const string KeyA = "BufferA";
+        
+        var window = TimeSpan.FromMinutes(10);
 
-        // We create a buffer implicitly by setting its capacity.
-        await grain.SetBufferCapacity(KeyA, 10);
-        Assert.Equal(10, await grain.GetBufferCapacity(KeyA));
+        await grain.SetBufferWindow(KeyA, window);
+        Assert.Equal(window, await grain.GetBufferWindow(KeyA));
 
-        // Than we enqueue an item. This calls GetBuffer(KeyA).
-        // Because the grain now remembers the capacity is 10, it will be used,
-        // and the durable state's capacity will not be changed.
         await grain.Enqueue(KeyA, "item1");
 
-        // The capacity should have NOT changed.
-        Assert.Equal(10, await grain.GetBufferCapacity(KeyA));
+        Assert.Equal(window, await grain.GetBufferWindow(KeyA));
         Assert.Equal(1, await grain.GetBufferItemsCount(KeyA));
 
-        // Otherwise if we explicitly set the capacity to something new, it should always work.
-        await grain.SetBufferCapacity(KeyA, 99);
-        Assert.Equal(99, await grain.GetBufferCapacity(KeyA));
+        var newWindow = TimeSpan.FromHours(1);
+        await grain.SetBufferWindow(KeyA, newWindow);
+        Assert.Equal(newWindow, await grain.GetBufferWindow(KeyA));
     }
 
     [Fact]
@@ -173,31 +169,29 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
         const string KeyA = "BufferA";
         const string KeyB = "BufferB";
 
-        await grain.SetBufferCapacity(KeyA, 3);
-        await grain.SetBufferCapacity(KeyB, 5);
+        await grain.SetBufferWindow(KeyA, TimeSpan.FromSeconds(10));
+        await grain.SetBufferWindow(KeyB, TimeSpan.FromSeconds(30));
 
-        await grain.Enqueue(KeyA, "a1");
+        await grain.Enqueue(KeyA, "a1"); // t=0
+        fixture.TimeProvider.Advance(TimeSpan.FromSeconds(5));
+        await grain.Enqueue(KeyB, "b1"); // t=5
+
         Assert.Equal(1, await grain.GetBufferItemsCount(KeyA));
-        Assert.Equal(0, await grain.GetBufferItemsCount(KeyB));
+        Assert.Equal(1, await grain.GetBufferItemsCount(KeyB));
         Assert.Equal(["a1"], await grain.GetAllBufferItems(KeyA));
-        Assert.Empty(await grain.GetAllBufferItems(KeyB));
+        Assert.Equal(["b1"], await grain.GetAllBufferItems(KeyB));
 
-        await grain.Enqueue(KeyB, "b1");
-        await grain.Enqueue(KeyB, "b2");
+        // We advance the time so that 'a1' expires but 'b1' does not.
+        // Total elapsed time = 5s + 6s = 11s.
+        // 'a1' (11s old) is older than its 10s window.
+        // 'b1' (6s old) is within its 30s window.
+        fixture.TimeProvider.Advance(TimeSpan.FromSeconds(6));
+        await grain.Enqueue(KeyA, "a2"); // This enqueue should purge old items from BufferA
+
         Assert.Equal(1, await grain.GetBufferItemsCount(KeyA));
-        Assert.Equal(2, await grain.GetBufferItemsCount(KeyB));
-        Assert.Equal(["b1", "b2"], await grain.GetAllBufferItems(KeyB));
-
-        var (success, item) = await grain.TryDequeue(KeyA);
-        Assert.True(success);
-        Assert.Equal("a1", item);
-        Assert.Empty(await grain.GetAllBufferItems(KeyA));
-        Assert.Equal(2, await grain.GetBufferItemsCount(KeyB));
-
-        await grain.Enqueue(KeyA, "a2"); // Put something back in "BufferA"
-        await grain.ClearBuffer(KeyB);
-        Assert.Equal(1, await grain.GetBufferItemsCount(KeyA));
-        Assert.Equal(0, await grain.GetBufferItemsCount(KeyB));
+        Assert.Equal(["a2"], await grain.GetAllBufferItems(KeyA));
+        Assert.Equal(1, await grain.GetBufferItemsCount(KeyB));
+        Assert.Equal(["b1"], await grain.GetAllBufferItems(KeyB));
     }
 
     [Fact]
@@ -209,17 +203,17 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
         const string KeyB = "BufferB";
         const string KeyC = "BufferC";
 
-        await grain.SetBufferCapacity(KeyA, 10);
-        await grain.SetBufferCapacity(KeyB, 10);
-        await grain.SetBufferCapacity(KeyC, 10);
+        await grain.SetBufferWindow(KeyA, TimeSpan.FromMinutes(10));
+        await grain.SetBufferWindow(KeyB, TimeSpan.FromMinutes(20));
+        await grain.SetBufferWindow(KeyC, TimeSpan.FromMinutes(30));
         await grain.Enqueue(KeyA, "a1");
         await grain.Enqueue(KeyA, "a2");
         await grain.Enqueue(KeyB, "b1");
         await grain.RemoveBuffer(KeyC);
 
-        var capacities1 = await grain.GetAllCapacities();
+        var windows1 = await grain.GetAllWindows();
         await DeactivateGrain(grain);
-        await grain.SetAllCapacities(capacities1);
+        await grain.SetAllWindows(windows1);
 
         Assert.Equal(2, await grain.GetBuffersCount());
         Assert.True(await grain.ContainsBuffer(KeyA));
@@ -231,12 +225,12 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
         Assert.Equal(1, await grain.GetBufferItemsCount(KeyB));
         Assert.Equal(["b1"], await grain.GetAllBufferItems(KeyB));
 
-        await grain.TryDequeue(KeyA); // Should only remove item "a1" not "BufferA"
+        await grain.TryDequeue(KeyA); // Should only remove item "a1"
         await grain.RemoveBuffer(KeyB);
 
-        var capacities2 = await grain.GetAllCapacities();
+        var windows2 = await grain.GetAllWindows();
         await DeactivateGrain(grain);
-        await grain.SetAllCapacities(capacities2);
+        await grain.SetAllWindows(windows2);
 
         Assert.Equal(1, await grain.GetBuffersCount());
         Assert.True(await grain.ContainsBuffer(KeyA));
@@ -256,14 +250,17 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
         {
             var key = $"key-{i}";
 
-            await grain.SetBufferCapacity(key, 5);
+            await grain.SetBufferWindow(key, TimeSpan.FromSeconds(100));
             await grain.Enqueue(key, $"item-{i}-1");
+
+            fixture.TimeProvider.Advance(TimeSpan.FromMilliseconds(1)); // We should advance time a bit to have unique timestamps
+            
             await grain.Enqueue(key, $"item-{i}-2");
         }
 
-        var capacities = await grain.GetAllCapacities();
+        var windows = await grain.GetAllWindows();
         await DeactivateGrain(grain); // To trigger a restore from the snapshot
-        await grain.SetAllCapacities(capacities);
+        await grain.SetAllWindows(windows);
 
         Assert.Equal(NumBuffers, await grain.GetBuffersCount());
 

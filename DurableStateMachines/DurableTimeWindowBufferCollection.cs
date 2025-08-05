@@ -8,47 +8,47 @@ using System.Runtime.CompilerServices;
 namespace Ledjon.DurableStateMachines;
 
 /// <summary>
-/// Defines a durable collection of named, fixed-size circular buffers.
+/// Defines a durable collection of named, time-based window buffers.
 /// </summary>
-/// <typeparam name="TKey">The type of the key used to identify each ring buffer.</typeparam>
-/// <typeparam name="TValue">The type of elements in the ring buffers.</typeparam>
-public interface IDurableRingBufferCollection<TKey, TValue> where TKey : notnull
+/// <typeparam name="TKey">The type of the key used to identify each window buffer.</typeparam>
+/// <typeparam name="TValue">The type of elements in the window buffers.</typeparam>
+public interface IDurableTimeWindowBufferCollection<TKey, TValue> where TKey : notnull
 {
     /// <summary>
-    /// Gets the number of ring buffers in the collection.
+    /// Gets the number of window buffers in the collection.
     /// </summary>
     int Count { get; }
 
     /// <summary>
-    /// Gets a reado-only collection containing the keys of the ring buffers.
+    /// Gets a read-only collection containing the keys of the window buffers.
     /// </summary>
     IReadOnlyCollection<TKey> Keys { get; }
 
     /// <summary>
-    /// Ensures that a ring buffer associated with the specified key exists and is configured with the given capacity.
+    /// Ensures that a window buffer associated with the specified key exists and is configured with the given time window.
     /// </summary>
-    /// <param name="key">The key of the ring buffer to ensure.</param>
-    /// <param name="capacity">The desired capacity for the ring buffer.</param>
-    /// <returns>A durable proxy to the ring buffer, which will have the specified capacity after this call.</returns>
+    /// <param name="key">The key of the window buffer to ensure.</param>
+    /// <param name="window">The desired time window for the buffer.</param>
+    /// <returns>A durable proxy to the window buffer, which will have the specified window after this call.</returns>
     /// <remarks>
     /// <para>
-    /// This method provides a convenient way to get a buffer and set its capacity in a single, atomic operation.
-    /// If a buffer for the given <paramref name="key"/> does not exist, it will be created with the specified <paramref name="capacity"/>.
-    /// If the buffer already exists, its capacity will be overwritten with the new value (if different).
+    /// This method provides a convenient way to get a buffer and set its time window in a single, atomic operation.
+    /// If a buffer for the given <paramref name="key"/> does not exist, it will be created with the specified <paramref name="window"/>.
+    /// If the buffer already exists, its time window will be overwritten with the new value (if different).
     /// </para>
-    /// <para><strong>Decreasing the capacity on an existing buffer may result in data loss, if the number of items currently in the buffer exceeds the new capacity.</strong></para>
+    /// <para><strong>Decreasing the time window on an existing buffer may result in data loss, if items fall outside the new (smaller) window.</strong></para>
     /// </remarks>
-    IDurableRingBuffer<TValue> EnsureBuffer(TKey key, int capacity);
+    IDurableTimeWindowBuffer<TValue> EnsureBuffer(TKey key, TimeSpan window);
 
     /// <summary>
-    /// Determines whether the collection contains a ring buffer with the specified key.
+    /// Determines whether the collection contains a window buffer with the specified key.
     /// </summary>
     /// <param name="key">The key to locate.</param>
     /// <returns><c>true</c> if the collection contains a buffer with the key; otherwise, <c>false</c>.</returns>
     bool Contains(TKey key);
 
     /// <summary>
-    /// Removes the ring buffer associated with the specified key from the collection.
+    /// Removes the window buffer associated with the specified key from the collection.
     /// </summary>
     /// <param name="key">The key of the buffer to remove.</param>
     /// <returns><c>true</c> if the buffer was successfully found and removed; otherwise, <c>false</c>.</returns>
@@ -61,9 +61,9 @@ public interface IDurableRingBufferCollection<TKey, TValue> where TKey : notnull
 }
 
 [DebuggerDisplay("Count = {Count}")]
-[DebuggerTypeProxy(typeof(DurableRingBufferCollectionDebugView<,>))]
-internal sealed class DurableRingBufferCollection<TKey, TValue> :
-    IDurableRingBufferCollection<TKey, TValue>, IDurableStateMachine
+[DebuggerTypeProxy(typeof(DurableTimeWindowBufferCollectionDebugView<,>))]
+internal sealed class DurableTimeWindowBufferCollection<TKey, TValue> :
+    IDurableTimeWindowBufferCollection<TKey, TValue>, IDurableStateMachine
         where TKey : notnull
 {
     private const byte VersionByte = 0;
@@ -72,18 +72,20 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
 
     private readonly IFieldCodec<TKey> _keyCodec;
     private readonly IFieldCodec<TValue> _valueCodec;
+    private readonly TimeProvider _timeProvider;
     private readonly SerializerSessionPool _sessionPool;
-    private readonly Dictionary<TKey, RingBufferProxy> _proxies = [];
+    private readonly Dictionary<TKey, TimeWindowBufferProxy> _proxies = [];
 
-    public DurableRingBufferCollection(
+    public DurableTimeWindowBufferCollection(
         [ServiceKey] string key, IStateMachineManager manager,
         IFieldCodec<TKey> keyCodec, IFieldCodec<TValue> valueCodec,
-        SerializerSessionPool sessionPool)
+        TimeProvider timeProvider, SerializerSessionPool sessionPool)
     {
         ArgumentException.ThrowIfNullOrEmpty(key);
 
         _keyCodec = keyCodec;
         _valueCodec = valueCodec;
+        _timeProvider = timeProvider;
         _sessionPool = sessionPool;
 
         manager.RegisterStateMachine(key, this);
@@ -92,14 +94,14 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
     public int Count => _proxies.Count;
     public IReadOnlyCollection<TKey> Keys => _proxies.Keys;
 
-    public IDurableRingBuffer<TValue> EnsureBuffer(TKey key, int capacity)
+    public IDurableTimeWindowBuffer<TValue> EnsureBuffer(TKey key, TimeSpan window)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity, nameof(capacity));
+        TimeWindowBuffer<TValue>.ThrowIfTooShortWindow((long)window.TotalSeconds);
 
         var proxy = GetOrCreateProxy(key);
-        if (proxy.Capacity != capacity)
+        if (proxy.Window != window)
         {
-            proxy.SetCapacity(capacity);
+            proxy.SetWindow(window);
         }
 
         return proxy;
@@ -116,6 +118,7 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
                 var (self, key) = state;
 
                 using var session = self._sessionPool.GetSession();
+
                 var writer = Writer.Create(bufferWriter, session);
 
                 writer.WriteByte(VersionByte);
@@ -173,7 +176,7 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
 
         if (version != VersionByte)
         {
-            throw new NotSupportedException($"This instance of {nameof(DurableRingBufferCollection<TKey, TValue>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
+            throw new NotSupportedException($"This instance of {nameof(DurableTimeWindowBufferCollection<TKey, TValue>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
         }
 
         var command = (CommandType)reader.ReadVarUInt32();
@@ -184,10 +187,9 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
             case CommandType.ClearAll: ApplyClear(); break;
             case CommandType.ClearBuffer: _ = ApplyClearBuffer(ReadKey(ref reader)); break;
             case CommandType.RemoveBuffer: _ = ApplyRemove(ReadKey(ref reader)); break;
-            case CommandType.SetCapacity: _ = ApplySetBufferCapacity(ReadKey(ref reader), (int)reader.ReadVarUInt32()); break;
-            case CommandType.EnqueueItem: ApplyEnqueueBufferItem(ReadKey(ref reader), ReadValue(ref reader)); break;
+            case CommandType.SetWindow: _ = ApplySetBufferWindow(ReadKey(ref reader), (long)reader.ReadVarUInt64()); break;
+            case CommandType.EnqueueItem: ApplyEnqueueBufferItem(ReadKey(ref reader), ReadValue(ref reader), (long)reader.ReadVarUInt64()); break;
             case CommandType.DequeueItem: _ = ApplyTryDequeueBufferItem(ReadKey(ref reader), out _); break;
-
             default: throw new NotSupportedException($"Command type {command} is not supported");
         }
 
@@ -210,19 +212,23 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
             ApplyClear();
 
             var bufferCount = (int)reader.ReadVarUInt32();
+            var currentTimestamp = _timeProvider.GetUtcNow().ToUnixTimeSeconds();
 
             for (var i = 0; i < bufferCount; i++)
             {
                 var key = ReadKey(ref reader);
-                var capacity = (int)reader.ReadVarUInt32();
+                var windowSeconds = (long)reader.ReadVarUInt64();
                 var itemCount = (int)reader.ReadVarUInt32();
 
                 var buffer = GetOrCreateProxy(key).Buffer;
-                buffer.SetCapacity(capacity);
+                buffer.SetWindow(windowSeconds, currentTimestamp);
 
                 for (var j = 0; j < itemCount; j++)
                 {
-                    buffer.Enqueue(ReadValue(ref reader));
+                    var value = ReadValue(ref reader);
+                    var timestamp = (long)reader.ReadVarUInt64();
+
+                    buffer.Enqueue(value, timestamp);
                 }
             }
         }
@@ -248,13 +254,14 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
 
                 var buffer = proxy.Buffer;
 
-                writer.WriteVarUInt32((uint)buffer.Capacity);
+                writer.WriteVarUInt64((ulong)buffer.WindowSeconds);
                 writer.WriteVarUInt32((uint)buffer.Count);
 
                 // Then for each buffer we write its items.
-                foreach (var item in buffer)
+                foreach (var (item, timestamp) in buffer.GetEntries())
                 {
                     self._valueCodec.WriteField(ref writer, 0, typeof(TValue), item);
+                    writer.WriteVarUInt64((ulong)timestamp);
                 }
             }
 
@@ -262,42 +269,43 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
         }, this);
     }
 
-    private bool SetBufferCapacity(TKey key, int capacity)
+    private bool SetBufferWindow(TKey key, long windowSeconds)
     {
-        if (ApplySetBufferCapacity(key, capacity))
+        if (ApplySetBufferWindow(key, windowSeconds))
         {
             GetStorage().AppendEntry(static (state, bufferWriter) =>
             {
-                var (self, key, capacity) = state;
+                var (self, key, windowSeconds) = state;
 
                 using var session = self._sessionPool.GetSession();
-
+                
                 var writer = Writer.Create(bufferWriter, session);
 
                 writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)CommandType.SetCapacity);
+                writer.WriteVarUInt32((uint)CommandType.SetWindow);
 
                 self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
-                writer.WriteVarUInt32((uint)capacity);
+                writer.WriteVarUInt64((ulong)windowSeconds);
 
                 writer.Commit();
-            }, (this, key, capacity));
-
+            }, (this, key, windowSeconds));
             return true;
         }
-
         return false;
     }
 
     private void EnqueueItem(TKey key, TValue item)
     {
-        ApplyEnqueueBufferItem(key, item);
+        var timestamp = _timeProvider.GetUtcNow().ToUnixTimeSeconds();
+
+        ApplyEnqueueBufferItem(key, item, timestamp);
+
         GetStorage().AppendEntry(static (state, bufferWriter) =>
         {
-            var (self, key, item) = state;
+            var (self, key, item, timestamp) = state;
 
             using var session = self._sessionPool.GetSession();
-
+            
             var writer = Writer.Create(bufferWriter, session);
 
             writer.WriteByte(VersionByte);
@@ -305,9 +313,10 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
 
             self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
             self._valueCodec.WriteField(ref writer, 0, typeof(TValue), item);
+            writer.WriteVarUInt64((ulong)timestamp);
 
             writer.Commit();
-        }, (this, key, item));
+        }, (this, key, item, timestamp));
     }
 
     private bool TryDequeueItem(TKey key, [MaybeNullWhen(false)] out TValue item)
@@ -329,10 +338,8 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
 
                 writer.Commit();
             }, (this, key));
-
             return true;
         }
-
         item = default;
         return false;
     }
@@ -346,12 +353,12 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
                 var (self, key) = state;
 
                 using var session = self._sessionPool.GetSession();
-
+                
                 var writer = Writer.Create(bufferWriter, session);
 
                 writer.WriteByte(VersionByte);
                 writer.WriteVarUInt32((uint)CommandType.ClearBuffer);
-
+                
                 self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
 
                 writer.Commit();
@@ -359,22 +366,21 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
         }
     }
 
-    private bool ApplyRemove(TKey key) => _proxies.Remove(key, out _);
-    private bool ApplySetBufferCapacity(TKey key, int capacity) => GetOrCreateProxy(key).Buffer.SetCapacity(capacity);
-    private void ApplyEnqueueBufferItem(TKey key, TValue item) => GetOrCreateProxy(key).Buffer.Enqueue(item);
+    private bool ApplyRemove(TKey key) => _proxies.Remove(key);
+    private bool ApplySetBufferWindow(TKey key, long windowSeconds) => GetOrCreateProxy(key).Buffer.SetWindow(windowSeconds, _timeProvider.GetUtcNow().ToUnixTimeSeconds());
+    private void ApplyEnqueueBufferItem(TKey key, TValue item, long timestamp) => GetOrCreateProxy(key).Buffer.Enqueue(item, timestamp);
     private bool ApplyTryDequeueBufferItem(TKey key, out TValue item) => GetOrCreateProxy(key).Buffer.TryDequeue(out item!);
     private bool ApplyClearBuffer(TKey key) => GetOrCreateProxy(key).Buffer.Clear();
     private void ApplyClear() => _proxies.Clear();
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal RingBufferProxy GetOrCreateProxy(TKey key)
+    internal TimeWindowBufferProxy GetOrCreateProxy(TKey key)
     {
         if (!_proxies.TryGetValue(key, out var proxy))
         {
-            proxy = new RingBufferProxy(key, this);
+            proxy = new TimeWindowBufferProxy(key, this);
             _proxies[key] = proxy;
         }
-
         return proxy;
     }
 
@@ -392,23 +398,21 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
         ClearAll = 1,
         ClearBuffer = 2,
         RemoveBuffer = 3,
-        SetCapacity = 4,
+        SetWindow = 4,
         EnqueueItem = 5,
         DequeueItem = 6
-
     }
 
-    internal sealed class RingBufferProxy(TKey key, 
-        DurableRingBufferCollection<TKey, TValue> collection) : IDurableRingBuffer<TValue>
+    internal sealed class TimeWindowBufferProxy(TKey key, 
+        DurableTimeWindowBufferCollection<TKey, TValue> collection) : IDurableTimeWindowBuffer<TValue>
     {
-        public RingBuffer<TValue> Buffer { get; } = new();
+        public TimeWindowBuffer<TValue> Buffer { get; } = new();
 
         public int Count => Buffer.Count;
-        public int Capacity => Buffer.Capacity;
         public bool IsEmpty => Buffer.IsEmpty;
-        public bool IsFull => Buffer.IsFull;
+        public TimeSpan Window => TimeSpan.FromSeconds(Buffer.WindowSeconds);
 
-        public bool SetCapacity(int capacity) => collection.SetBufferCapacity(key, capacity);
+        public bool SetWindow(TimeSpan window) => collection.SetBufferWindow(key, (long)window.TotalSeconds);
         public void Enqueue(TValue item) => collection.EnqueueItem(key, item);
         public bool TryDequeue([MaybeNullWhen(false)] out TValue item) => collection.TryDequeueItem(key, out item);
         public void Clear() => collection.ClearBuffer(key);
@@ -438,8 +442,8 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
     }
 }
 
-internal sealed class DurableRingBufferCollectionDebugView<TKey, TValue>(
-    DurableRingBufferCollection<TKey, TValue> collection) 
+internal sealed class DurableTimeWindowBufferCollectionDebugView<TKey, TValue>(
+    DurableTimeWindowBufferCollection<TKey, TValue> collection)
         where TKey : notnull
 {
     [DebuggerBrowsable(DebuggerBrowsableState.RootHidden)]
@@ -455,7 +459,7 @@ internal sealed class DurableRingBufferCollectionDebugView<TKey, TValue>(
                 var proxy = collection.GetOrCreateProxy(key);
                 result[i++] = new KeyValuePair<TKey, TValue[]>(key, [.. proxy]);
             }
-            
+
             return result;
         }
     }

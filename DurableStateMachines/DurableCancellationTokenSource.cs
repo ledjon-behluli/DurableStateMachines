@@ -97,7 +97,7 @@ internal sealed class DurableCancellationTokenSource : IDurableCancellationToken
     private ScheduledCancellation _scheduledCancellation;
 
     private CancellationTokenRegistration _ctsr;
-    private CancellationTokenSource _cts = new();
+    private CancellationTokenSource _cts;
 
     private readonly ReaderWriterLockSlim _lock = new();
     private readonly TimeProvider _timeProvider;
@@ -139,6 +139,7 @@ internal sealed class DurableCancellationTokenSource : IDurableCancellationToken
         _sessionPool = sessionPool;
         _manager = manager;
 
+        _cts = new(Timeout.InfiniteTimeSpan, _timeProvider);
         _ctsr = ObserveCancellation();
         _scheduledCancellation.Reset();
         _manager.RegisterStateMachine(key, this);
@@ -340,7 +341,7 @@ internal sealed class DurableCancellationTokenSource : IDurableCancellationToken
             // It is best we crate a new CTS upon reseting, because we publicly expose cts.Token, and we cannot "un-cancel" its source
             // without violating the contract with consumers who may have registered callbacks, or have passed the token to other operations.
 
-            _cts = new CancellationTokenSource();
+            _cts = new(Timeout.InfiniteTimeSpan, _timeProvider);
             _ctsr = ObserveCancellation();
         }
 

@@ -103,7 +103,7 @@ public class DurableCancellationTokenTests(TestFixture fixture)
 
         Assert.False(await grain.IsCancellationPending());
 
-        await Task.Delay(delay + TimeSpan.FromMilliseconds(250));
+        fixture.TimeProvider.Advance(delay + TimeSpan.FromMilliseconds(250));
 
         Assert.True(await grain.IsCancellationPending());
         await Assert.ThrowsAsync<OperationCanceledException>(grain.ThrowIfCancellationRequested);
@@ -118,7 +118,7 @@ public class DurableCancellationTokenTests(TestFixture fixture)
         await grain.CancelAfter(delay);
         await DeactivateGrain(grain);
 
-        await Task.Delay(delay + TimeSpan.FromMilliseconds(250));
+        fixture.TimeProvider.Advance(delay + TimeSpan.FromMilliseconds(250));
 
         Assert.True(await grain.IsCancellationPending());
         await Assert.ThrowsAsync<OperationCanceledException>(grain.ThrowIfCancellationRequested);
@@ -135,11 +135,11 @@ public class DurableCancellationTokenTests(TestFixture fixture)
         await grain.CancelAfter(fullDelay);
         await DeactivateGrain(grain);
 
-        await Task.Delay(firstWait);
+        fixture.TimeProvider.Advance(firstWait);
 
         Assert.False(await grain.IsCancellationPending());
 
-        await Task.Delay(remainingWait + TimeSpan.FromMilliseconds(500));
+        fixture.TimeProvider.Advance(remainingWait + TimeSpan.FromMilliseconds(500));
 
         Assert.True(await grain.IsCancellationPending());
         await Assert.ThrowsAsync<OperationCanceledException>(grain.ThrowIfCancellationRequested);
@@ -171,7 +171,7 @@ public class DurableCancellationTokenTests(TestFixture fixture)
         await grain.CancelAfter(longerDelay);
         await grain.CancelAfter(shorterDelay);
 
-        await Task.Delay(shorterDelay + TimeSpan.FromMilliseconds(250));
+        fixture.TimeProvider.Advance(shorterDelay + TimeSpan.FromMilliseconds(250));
 
         Assert.True(await grain.IsCancellationPending());
         await Assert.ThrowsAsync<OperationCanceledException>(grain.ThrowIfCancellationRequested);
