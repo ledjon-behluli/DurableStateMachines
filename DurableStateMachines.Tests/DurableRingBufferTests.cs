@@ -103,6 +103,9 @@ public class DurableRingBufferTests(TestFixture fixture)
     {
         var grain = GetGrain("basic");
 
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => grain.SetCapacity(-1));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => grain.SetCapacity(0));
+
         await grain.SetCapacity(3);
 
         await grain.Enqueue("one");

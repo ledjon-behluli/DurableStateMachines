@@ -1,5 +1,4 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
-using System.Diagnostics;
 
 namespace DurableStateMachines.Tests;
 
@@ -8,11 +7,18 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
 {
     public interface IDurableRingBufferCollectionGrain : IGrainWithStringKey
     {
+        // Workaround methods to survive deactivation
+        Task<Dictionary<string, int>> GetAllCapacities();
+        Task SetAllCapacities(Dictionary<string, int> capacities);
+
+        // Collection methods
         Task<int> GetBuffersCount();
         Task<List<string>> GetKeys();
         Task<bool> ContainsBuffer(string key);
         Task<bool> RemoveBuffer(string key);
         Task ClearAll();
+
+        // Buffer methods
         Task Enqueue(string key, string value);
         Task<TryValue<string?>> TryDequeue(string key);
         Task SetBufferCapacity(string key, int capacity);
@@ -27,6 +33,25 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
             : DurableGrain, IDurableRingBufferCollectionGrain
     {
         private const int DefaultCapacity = 1;
+        private readonly Dictionary<string, int> _capacities = [];
+
+        private IDurableRingBuffer<string> GetBuffer(string key)
+        {
+            var capacity = _capacities.GetValueOrDefault(key, DefaultCapacity);
+            return state.EnsureBuffer(key, capacity);
+        }
+
+        public Task<Dictionary<string, int>> GetAllCapacities() => Task.FromResult(new Dictionary<string, int>(_capacities));
+
+        public Task SetAllCapacities(Dictionary<string, int> capacities)
+        {
+            _capacities.Clear();
+            foreach (var (key, value) in capacities)
+            {
+                _capacities[key] = value;
+            }
+            return Task.CompletedTask;
+        }
 
         public Task<int> GetBuffersCount() => Task.FromResult(state.Count);
         public Task<List<string>> GetKeys() => Task.FromResult(state.Keys.ToList());
@@ -37,6 +62,7 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
             var removed = state.Remove(key);
             if (removed)
             {
+                _capacities.Remove(key);
                 await WriteStateAsync();
             }
             return removed;
@@ -44,19 +70,21 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
 
         public async Task ClearAll()
         {
+            _capacities.Clear();
             state.Clear();
+
             await WriteStateAsync();
         }
 
         public async Task Enqueue(string key, string value)
         {
-            state.GetOrCreate(key, DefaultCapacity).Enqueue(value);
+            GetBuffer(key).Enqueue(value);
             await WriteStateAsync();
         }
 
         public async Task<TryValue<string?>> TryDequeue(string key)
         {
-            var success = state.GetOrCreate(key, DefaultCapacity).TryDequeue(out var item);
+            var success = GetBuffer(key).TryDequeue(out var item);
             if (success)
             {
                 await WriteStateAsync();
@@ -66,19 +94,20 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
 
         public async Task SetBufferCapacity(string key, int capacity)
         {
-            state.GetOrCreate(key, DefaultCapacity).SetCapacity(capacity); 
+            _capacities[key] = capacity;
+            GetBuffer(key); // This will use the now just set '_capacities[key]', as it does EnsureBuffer(key, capacity).
             await WriteStateAsync();
         }
 
         public async Task ClearBuffer(string key)
         {
-            state.GetOrCreate(key, DefaultCapacity).Clear();
+            GetBuffer(key).Clear();
             await WriteStateAsync();
         }
 
-        public Task<int> GetBufferCapacity(string key) => Task.FromResult(state.GetOrCreate(key, DefaultCapacity).Capacity);
-        public Task<int> GetBufferItemsCount(string key) => Task.FromResult(state.GetOrCreate(key, DefaultCapacity).Count);
-        public Task<List<string>> GetAllBufferItems(string key) => Task.FromResult(state.GetOrCreate(key, DefaultCapacity).ToList());
+        public Task<int> GetBufferCapacity(string key) => Task.FromResult(GetBuffer(key).Capacity);
+        public Task<int> GetBufferItemsCount(string key) => Task.FromResult(GetBuffer(key).Count);
+        public Task<List<string>> GetAllBufferItems(string key) => Task.FromResult(GetBuffer(key).ToList());
     }
 
     private IDurableRingBufferCollectionGrain GetGrain(string key) => fixture.Cluster.Client.GetGrain<IDurableRingBufferCollectionGrain>(key);
@@ -119,15 +148,15 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
         const string keyA = "BufferA";
 
         // We create a buffer implicitly by setting its capacity.
-        // This calls GetOrCreate(keyA, DefaultCapacity) which creates the buffer and sets capacity to 10.
         await grain.SetBufferCapacity(keyA, 10);
         Assert.Equal(10, await grain.GetBufferCapacity(keyA));
 
-        // Than we enqueue an item. This calls GetOrCreate(keyA, DefaultCapacity).
-        // Because the buffer already exists, the capacity parameter should be ignored.
+        // Than we enqueue an item. This calls GetBuffer(keyA).
+        // Because the grain now remembers the capacity is 10, it will be used,
+        // and the durable state's capacity will not be changed.
         await grain.Enqueue(keyA, "item1");
 
-        // The capacity should have NOT changed to the default.
+        // The capacity should have NOT changed.
         Assert.Equal(10, await grain.GetBufferCapacity(keyA));
         Assert.Equal(1, await grain.GetBufferItemsCount(keyA));
 
@@ -188,7 +217,9 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
         await grain.Enqueue(KeyB, "b1");
         await grain.RemoveBuffer(KeyC);
 
+        var capacities1 = await grain.GetAllCapacities();
         await DeactivateGrain(grain);
+        await grain.SetAllCapacities(capacities1);
 
         Assert.Equal(2, await grain.GetBuffersCount());
         Assert.True(await grain.ContainsBuffer(KeyA));
@@ -203,7 +234,9 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
         await grain.TryDequeue(KeyA); // Should only remove item "a1" not "BufferA"
         await grain.RemoveBuffer(KeyB);
 
+        var capacities2 = await grain.GetAllCapacities();
         await DeactivateGrain(grain);
+        await grain.SetAllCapacities(capacities2);
 
         Assert.Equal(1, await grain.GetBuffersCount());
         Assert.True(await grain.ContainsBuffer(KeyA));
@@ -228,7 +261,9 @@ public class DurableRingBufferCollectionTests(TestFixture fixture)
             await grain.Enqueue(key, $"item-{i}-2");
         }
 
+        var capacities = await grain.GetAllCapacities();
         await DeactivateGrain(grain); // To trigger a restore from the snapshot
+        await grain.SetAllCapacities(capacities);
 
         Assert.Equal(numBuffers, await grain.GetBuffersCount());
 

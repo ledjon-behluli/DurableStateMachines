@@ -25,12 +25,23 @@ public interface IDurableRingBufferCollection<TKey, TValue> where TKey : notnull
     IReadOnlyCollection<TKey> Keys { get; }
 
     /// <summary>
-    /// Gets or creates the ring buffer associated with the specified key.
+    /// Ensures that a ring buffer associated with the specified key exists and is configured with the given capacity.
     /// </summary>
-    /// <param name="key">The key of the ring buffer to get or create.</param>
-    /// <param name="capacity">The capacity to use when creating a new buffer, if it does not exist.</param>
-    /// <returns>A proxy to the ring buffer that ensures all operations are durable.</returns>
-    IDurableRingBuffer<TValue> GetOrCreate(TKey key, int capacity);
+    /// <param name="key">The key of the ring buffer to ensure.</param>
+    /// <param name="capacity">The desired capacity for the ring buffer.</param>
+    /// <returns>A durable proxy to the ring buffer, which will have the specified capacity after this call.</returns>
+    /// <remarks>
+    /// <para>
+    /// This method provides a convenient way to get a buffer and set its capacity in a single, atomic operation.
+    /// If a buffer for the given <paramref name="key"/> does not exist, it will be created with the specified <paramref name="capacity"/>.
+    /// If the buffer already exists, its capacity will be overwritten with the new value (if its different).
+    /// </para>
+    /// <para><strong>
+    /// Decreasing the capacity on an existing buffer may result in data loss, if the number of items
+    /// currently in the buffer exceeds the new capacity.
+    /// </strong></para>
+    /// </remarks>
+    IDurableRingBuffer<TValue> EnsureBuffer(TKey key, int capacity);
 
     /// <summary>
     /// Determines whether the collection contains a ring buffer with the specified key.
@@ -84,11 +95,12 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
     public int Count => _proxies.Count;
     public IReadOnlyCollection<TKey> Keys => _proxies.Keys;
 
-    public IDurableRingBuffer<TValue> GetOrCreate(TKey key, int capacity)
+    public IDurableRingBuffer<TValue> EnsureBuffer(TKey key, int capacity)
     {
-        var proxy = GetOrCreateProxy(key, out var created);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity, nameof(capacity));
 
-        if (created)
+        var proxy = GetOrCreateProxy(key);
+        if (proxy.Capacity != capacity)
         {
             proxy.SetCapacity(capacity);
         }
@@ -208,7 +220,7 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
                 var capacity = (int)reader.ReadVarUInt32();
                 var itemCount = (int)reader.ReadVarUInt32();
 
-                var buffer = GetOrCreateProxy(key, out _).Buffer;
+                var buffer = GetOrCreateProxy(key).Buffer;
                 buffer.SetCapacity(capacity);
 
                 for (var j = 0; j < itemCount; j++)
@@ -351,23 +363,18 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
     }
 
     private bool ApplyRemove(TKey key) => _proxies.Remove(key, out _);
-    private bool ApplySetBufferCapacity(TKey key, int capacity) => GetOrCreateProxy(key, out _).Buffer.SetCapacity(capacity);
-    private void ApplyEnqueueBufferItem(TKey key, TValue item) => GetOrCreateProxy(key, out _).Buffer.Enqueue(item);
-    private bool ApplyTryDequeueBufferItem(TKey key, out TValue item) => GetOrCreateProxy(key, out _).Buffer.TryDequeue(out item!);
-    private bool ApplyClearBuffer(TKey key) => GetOrCreateProxy(key, out _).Buffer.Clear();
+    private bool ApplySetBufferCapacity(TKey key, int capacity) => GetOrCreateProxy(key).Buffer.SetCapacity(capacity);
+    private void ApplyEnqueueBufferItem(TKey key, TValue item) => GetOrCreateProxy(key).Buffer.Enqueue(item);
+    private bool ApplyTryDequeueBufferItem(TKey key, out TValue item) => GetOrCreateProxy(key).Buffer.TryDequeue(out item!);
+    private bool ApplyClearBuffer(TKey key) => GetOrCreateProxy(key).Buffer.Clear();
     private void ApplyClear() => _proxies.Clear();
 
-    internal RingBufferProxy GetOrCreateProxy(TKey key, out bool created)
+    internal RingBufferProxy GetOrCreateProxy(TKey key)
     {
-        created = false;
-
         if (!_proxies.TryGetValue(key, out var proxy))
         {
             proxy = new RingBufferProxy(key, this);
-
             _proxies[key] = proxy;
-
-            created = true;
         }
 
         return proxy;
@@ -448,7 +455,7 @@ internal sealed class DurableRingBufferCollectionDebugView<TKey, TValue>(
 
             foreach (var key in collection.Keys)
             {
-                var proxy = collection.GetOrCreateProxy(key, out _);
+                var proxy = collection.GetOrCreateProxy(key);
                 result[i++] = new KeyValuePair<TKey, TValue[]>(key, [.. proxy]);
             }
             
