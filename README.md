@@ -1,4 +1,5 @@
 
+
 # OrleansDurableStateMachines
 
 A suite of high-performance, specialized durable state machines for [Microsoft Orleans](https://github.com/dotnet/orleans). These state machines provide rich, structured data management inside a grain with efficient, fine-grained persistence.
@@ -58,6 +59,8 @@ public class JobSchedulerGrain(
 * [Object](#idurableobjectt)
 * [Ring Buffer](#idurableringbuffert)
 * [Ring Buffer Collection](#idurableringbuffercollectiontkey-tvalue)
+* [Time Window Buffer](#idurabletimewindowbuffert)
+* [Time Window Buffer Collection](#idurabletimewindowbuffercollectiontkey-tvalue)
 
 ---
 
@@ -267,6 +270,8 @@ A durable, persistent version of the standard  `CancellationTokenSource`. It all
     1.  **Persisting the Intent:**  You must call  `WriteStateAsync()`  to make the scheduled timeout durable across restarts.
     2.  **Automatic Persistence:**  Once the timer expires, the component will  **automatically trigger its own persistence**, setting the final canceled state without requiring another manual  `WriteStateAsync()`  call.
 
+> This component respects the registered [`TimeProvider`](https://learn.microsoft.com/en-us/dotnet/api/system.timeprovider).
+
 #### Callbacks and Threading
 
 Any callbacks registered via  `Token.Register()`  will execute on the default  `TaskScheduler`  (usually the .NET thread pool). This means callbacks will run  **outside the Orleans grain scheduler**, which is important to know for thread safety and accessing grain state.
@@ -420,7 +425,6 @@ A durable, fixed-size circular buffer (or queue) that stores the last N items. W
 // The buffer is created with a default capacity of 1.
 
 buffer.SetCapacity(3);
-await WriteStateAsync();
 
 buffer.Enqueue("A"); // Contains: [A]
 buffer.Enqueue("B"); // Contains: [A, B]
@@ -428,12 +432,10 @@ buffer.Enqueue("C"); // Contains: [A, B, C] -> IsFull = true
 
 // This will overwrite the oldest item, "A".
 buffer.Enqueue("D"); // Contains: [B, C, D]
-await WriteStateAsync();
 
 if (buffer.TryDequeue(out var item)) // item is "B"
 {
-    // Do something with 'item'.
-    await WriteStateAsync();
+    // Do something with 'item'
 }
 ```
 
@@ -480,9 +482,104 @@ Console.WriteLine(ReferenceEquals(buffer1, buffer3)); // True
 Console.WriteLine(buffer1.Capacity == 15); // True
 Console.WriteLine(buffer3.Capacity == 15); // True
 buffer3.Enqueue("Updated Profile");
+```
 
-// Atomically persist all changes!
-await WriteStateAsync();
+---
+
+### `IDurableTimeWindowBuffer<T>`
+
+A durable buffer that stores items added within a specific time window. When new items are added, any items older than the specified time window are automatically discarded.
+
+**Useful for:**
+
+-   Storing the last N  _minutes/hours/days_  of events or log messages.
+-   Implementing session tracking where user activity expires after a period of inactivity.
+
+#### Key Concepts
+
+-   **Minimum Window:**  The minimum allowed  window  is  **1 second**. Attempting to set a smaller duration will throw an  `ArgumentOutOfRangeException`.
+
+-   **Initial Window:**  Upon its initial creation, a time window buffer has a default window of  **1 hour**. You must explicitly call  `SetWindow(window)`  to configure it to your desired duration.
+    
+-   **Ordering & Eviction:**  The buffer behaves like a standard queue, so **FIFO**. Its unique feature is that enqueuing a new item  _or_  changing its window can trigger an automatic purge of any items older than the configured  time window.
+    
+-   **Time-Based Logic:**  The buffer's behavior is entirely dependent on the timestamps of its items.
+    
+-   **Dynamic Window:**  You can durably change the window at any time with  `SetWindow(window)`.
+    
+
+> ⚠️ Note that  **shrinking**  the window will  **discard**  any items that fall outside the new (*shorter*) duration.
+
+> This component respects the registered [`TimeProvider`](https://learn.microsoft.com/en-us/dotnet/api/system.timeprovider).
+
+```csharp
+// For tests, assume _timeProvider is a FakeTimeProvider.
+
+// The buffer is created with a default window of 1 hour.
+buffer.SetWindow(TimeSpan.FromSeconds(10));
+
+buffer.Enqueue("A"); // t=0. Contains: [A]
+_timeProvider.Advance(TimeSpan.FromSeconds(6));
+buffer.Enqueue("B"); // t=6. Contains: [A, B]
+
+// Total time is now 11s. "A" is 11s old, "B" is 5s old.
+// "A" is now outside the 10-second window.
+_timeProvider.Advance(TimeSpan.FromSeconds(5));
+
+// This enqueue triggers a purge of old items.
+// "A" is removed.
+buffer.Enqueue("C"); // t=11. Contains: [B, C]
+
+if (buffer.TryDequeue(out var item)) // item is "B"
+{
+  // Do something with 'item'
+}
+```
+
+---
+
+### `IDurableTimeWindowBufferCollection<TKey, TValue>`
+
+A one-to-many collection that maps a key to an independent  `IDurableTimeWindowBuffer<T>`, managed under a single state machine.
+
+**Useful for:**
+
+-   Tracking recent activity (*e.g., last 30 minutes*)  _per-user_  or  _per-session_.
+-   Storing recent telemetry data partitioned  _by device ID_.
+
+#### Key Concepts
+
+-   **Implicit Creation**: Buffers are created automatically the first time a key is accessed via  `EnsureBuffer(key, window)`. You don't need to check if a buffer exists before using it (*although you can*).
+    
+-   **Ensured Window**: The  `window`  parameter in  `EnsureBuffer(key, window)`  is always enforced. When a buffer is created, it is set with this window. If a buffer for that key already exists, its window will be overwritten with the new value, which may result in data loss if the new window is smaller.
+    
+-   **Isolation**: Each time-window buffer is completely independent. Operations on one buffer have no effect on any other. Time passing, affects all buffers, but eviction is based on each buffer's individual window.
+    
+-   **Fine-Grained Persistence**: Any operation on a single buffer results in a small, specific log-entry, rather than re-serializing all buffers.
+
+> This component respects the registered [`TimeProvider`](https://learn.microsoft.com/en-us/dotnet/api/system.timeprovider).
+    
+```csharp
+// Get a buffer for "user1".
+// Since it's new, it will be created with a window of 10 minutes.
+
+var buffer1 = collection.EnsureBuffer("user1", TimeSpan.FromMinutes(10));
+buffer1.Enqueue("Logged In");
+buffer1.Enqueue("Viewed Dashboard");
+
+// Get a buffer for another user. It is isolated from the above!
+var buffer2 = collection.EnsureBuffer("user2", TimeSpan.FromMinutes(5));
+buffer2.Enqueue("Viewed Product Page");
+
+// Because the buffer for "user1" already exists, calling EnsureBuffer
+// again will overwrite its window from 10 to 15 minutes.
+// The same buffer instance is returned.
+var buffer3 = collection.EnsureBuffer("user1", TimeSpan.FromMinutes(15));
+
+Console.WriteLine(ReferenceEquals(buffer1, buffer3)); // True
+Console.WriteLine(buffer1.Window == TimeSpan.FromMinutes(15)); // True
+Console.WriteLine(buffer3.Window == TimeSpan.FromMinutes(15)); // True
+buffer3.Enqueue("Updated Profile");
 ```
 
 ---
