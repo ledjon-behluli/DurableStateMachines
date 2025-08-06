@@ -413,6 +413,8 @@ A durable, fixed-size circular buffer (or queue) that stores the last N items. W
 
 #### Key Concepts
 
+-   **Minimum Capacity:** The minimum allowed capacity is **1**. Attempting to set a smaller capacity will throw an `ArgumentOutOfRangeException`.
+  
 -   **Initial Capacity:**  Upon its initial creation, a ring buffer has a default capacity of   **1**. You must explicitly call  `SetCapacity(int)`  to configure it to your desired size.
 
 -   **Ordering & Overwriting:**  The buffer behaves like a standard queue, so **FIFO**. Its unique feature is that enqueuing an item into a full buffer succeeds by removing the **oldest** item to make space.
