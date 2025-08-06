@@ -513,7 +513,7 @@ A durable buffer that stores items added within a specific time window. When new
 > This component respects the registered [`TimeProvider`](https://learn.microsoft.com/en-us/dotnet/api/system.timeprovider).
 
 ```csharp
-// For tests, assume _timeProvider is a FakeTimeProvider.
+// Assume '_timeProvider' is a 'FakeTimeProvider'.
 
 // The buffer is created with a default window of 1 hour.
 buffer.SetWindow(TimeSpan.FromSeconds(10));
