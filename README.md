@@ -22,23 +22,31 @@ Inherit from `DurableGrain` and inject one or more state machines using the `[Fr
 
 ```csharp
 public class JobSchedulerGrain(
-    [FromKeyedServices("job-queue")] 
-    IDurablePriorityQueue<string, int> jobs) 
-	    : DurableGrain, IJobSchedulerGrain
+   [FromKeyedServices("job-queue")] IDurablePriorityQueue<string, int> jobs)
+      : DurableGrain, IJobSchedulerGrain
 {
     public async Task AddJob(string jobName, int priority)
     {
-        // 1. Mutate the in-memory state.
+        // Add to the in-memory state.
         jobs.Enqueue(jobName, priority);
 
-        // 2. Persist the change to the journal.
+        // Persist the enqueue operation to the journal.
         await WriteStateAsync();
     }
 
-    public Task<string> GetNextJob()
+    public async Task<string?> GetNextJob()
     {
-        // Reads are always from the in-memory state.
-        return Task.FromResult(jobs.Peek());
+        string? jobName;
+
+        // Look inside the in-memory state.
+        if (jobs.TryDequeue(out jobName, out int priority))
+        {
+            // There is a job to work on!
+            // Persist the dequeue operation to the journal.
+            await WriteStateAsync();
+        }
+
+        return jobName;
     }
 }
 ```
