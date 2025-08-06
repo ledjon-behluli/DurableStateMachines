@@ -497,7 +497,7 @@ A durable buffer that stores items added within a specific time window. When new
 
 #### Key Concepts
 
--   **Minimum Window:**  The minimum allowed  window  is  **1 second**. Attempting to set a smaller duration will throw an  `ArgumentOutOfRangeException`.
+-   **Minimum Window:** The buffer's internal logic operates with a precision of **1 second**. The minimum allowed window is **1 second**. Attempting to set a smaller duration will throw an `ArgumentOutOfRangeException`.
 
 -   **Initial Window:**  Upon its initial creation, a time window buffer has a default window of  **1 hour**. You must explicitly call  `SetWindow(window)`  to configure it to your desired duration.
     
