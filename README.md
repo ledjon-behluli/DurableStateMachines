@@ -464,7 +464,7 @@ A one-to-many collection that maps a key to an independent `IDurableRingBuffer<T
 - **Fine-Grained Persistence**: Any operation on a single buffer results in a small, specific log-entry, rather than re-serializing all buffers.
 
 ```csharp
-// Get a buffer for "user1", it will be created with a capacity of 10.
+// Get a buffer for "user1". It will be created with a capacity of 10.
 
 var buffer1 = collection.EnsureBuffer("user1", 10);
 buffer1.Enqueue("Logged In");
@@ -561,7 +561,7 @@ A one-to-many collection that maps a key to an independent  `IDurableTimeWindowB
 > This component respects the registered [`TimeProvider`](https://learn.microsoft.com/en-us/dotnet/api/system.timeprovider).
     
 ```csharp
-// Get a buffer for "user1", it will be created with a window of 10 minutes.
+// Get a buffer for "user1". It will be created with a window of 10 minutes.
 
 var buffer1 = collection.EnsureBuffer("user1", TimeSpan.FromMinutes(10));
 buffer1.Enqueue("Logged In");
