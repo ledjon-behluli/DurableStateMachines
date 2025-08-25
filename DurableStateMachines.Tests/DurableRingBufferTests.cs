@@ -15,6 +15,7 @@ public class DurableRingBufferTests(TestFixture fixture)
         Task<int> GetCount();
         Task<bool> IsEmpty();
         Task<bool> IsFull();
+        Task<bool> Contains(string item);
         Task<List<string>> GetAll();
         Task<(int, string[])> CopyToArray(int arraySize, int arrayIndex);
         Task<(int, string[])> DrainToArray(int arraySize, int arrayIndex);
@@ -57,6 +58,7 @@ public class DurableRingBufferTests(TestFixture fixture)
         public Task<int> GetCount() => Task.FromResult(state.Count);
         public Task<bool> IsEmpty() => Task.FromResult(state.IsEmpty);
         public Task<bool> IsFull() => Task.FromResult(state.IsFull);
+        public Task<bool> Contains(string item) => Task.FromResult(state.Contains(item));
         public Task<List<string>> GetAll() => Task.FromResult(state.ToList());
 
         public Task<(int, string[])> CopyToArray(int arraySize, int arrayIndex)
@@ -126,6 +128,33 @@ public class DurableRingBufferTests(TestFixture fixture)
         var items2 = await grain.GetAll();
         Assert.Equal("one", items2.First());
         Assert.Equal("three", items2.Last());
+    }
+
+    [Fact]
+    public async Task Contains()
+    {
+        var grain = GetGrain("contains");
+        await grain.SetCapacity(3);
+
+        Assert.False(await grain.Contains("one"));
+
+        await grain.Enqueue("one");
+        await grain.Enqueue("two");
+
+        Assert.True(await grain.Contains("one"));
+        Assert.True(await grain.Contains("two"));
+        Assert.False(await grain.Contains("three"));
+
+        await grain.Enqueue("three");
+        await grain.Enqueue("four");
+
+        Assert.False(await grain.Contains("one"));
+        Assert.True(await grain.Contains("four"));
+
+        await grain.TryDequeue();
+
+        Assert.False(await grain.Contains("two"));
+        Assert.True(await grain.Contains("three"));
     }
 
     [Fact]

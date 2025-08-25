@@ -50,6 +50,16 @@ public interface IDurableTimeWindowBuffer<T> : IEnumerable<T>, IReadOnlyCollecti
     bool TryDequeue([MaybeNullWhen(false)] out T result);
 
     /// <summary>
+    /// Determines whether the buffer contains a specific value.
+    /// <para>
+    /// The comparison is performed using <see cref="EqualityComparer{T}.Default"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="item">The object to locate in the buffer. The value can be <c>null</c> for reference types.</param>
+    /// <returns><c>true</c> if <paramref name="item"/> is found in the buffer; otherwise, <c>false</c>.</returns>
+    bool Contains(T item);
+
+    /// <summary>
     /// Copies the elements of the buffer to an array, starting at a particular array index.
     /// The elements are copied in their logical order (from oldest to newest).
     /// </summary>
@@ -297,6 +307,7 @@ internal sealed class DurableTimeWindowBuffer<T> : IDurableTimeWindowBuffer<T>, 
         }
     }
 
+    public bool Contains(T item) => _buffer.Contains(item);
     public int CopyTo(T[] array, int arrayIndex) => _buffer.CopyTo(array, arrayIndex);
     public int CopyTo(Span<T> destination) => _buffer.CopyTo(destination);
 
@@ -363,6 +374,21 @@ internal sealed class TimeWindowBuffer<T> : IEnumerable<T>
         {
             throw new ArgumentOutOfRangeException(nameof(windowSeconds), "Window must be at least 1 second.");
         }
+    }
+
+    public bool Contains(T item)
+    {
+        var comparer = EqualityComparer<T>.Default;
+
+        foreach (var (current, _) in _buffer)
+        {
+            if (comparer.Equals(current, item))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public void Enqueue(T item, long timestamp)

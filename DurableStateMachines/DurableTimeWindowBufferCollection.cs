@@ -412,6 +412,7 @@ internal sealed class DurableTimeWindowBufferCollection<TKey, TValue> :
         public bool IsEmpty => Buffer.IsEmpty;
         public TimeSpan Window => TimeSpan.FromSeconds(Buffer.WindowSeconds);
 
+        public bool Contains(TValue item) => Buffer.Contains(item);
         public bool SetWindow(TimeSpan window) => collection.SetBufferWindow(key, (long)window.TotalSeconds);
         public void Enqueue(TValue item) => collection.EnqueueItem(key, item);
         public bool TryDequeue([MaybeNullWhen(false)] out TValue item) => collection.TryDequeueItem(key, out item);

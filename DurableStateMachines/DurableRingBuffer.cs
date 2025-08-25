@@ -55,6 +55,16 @@ public interface IDurableRingBuffer<T> : IEnumerable<T>, IReadOnlyCollection<T>
     bool TryDequeue([MaybeNullWhen(false)] out T result);
 
     /// <summary>
+    /// Determines whether the buffer contains a specific value.
+    /// <para>
+    /// The comparison is performed using <see cref="EqualityComparer{T}.Default"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="item">The object to locate in the buffer. The value can be <c>null</c> for reference types.</param>
+    /// <returns><c>true</c> if <paramref name="item"/> is found in the buffer; otherwise, <c>false</c>.</returns>
+    bool Contains(T item);
+
+    /// <summary>
     /// Copies the elements of the buffer to an array, starting at a particular array index.
     /// The elements are copied in their logical order (from oldest to newest).
     /// </summary>
@@ -292,6 +302,7 @@ internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStat
         }
     }
 
+    public bool Contains(T item) => _buffer.Contains(item);
     public int CopyTo(T[] array, int arrayIndex) => _buffer.CopyTo(array, arrayIndex);
     public int CopyTo(Span<T> destination) => _buffer.CopyTo(destination);
 
@@ -355,6 +366,50 @@ internal sealed class RingBuffer<T> : IEnumerable<T>
     public int Count => _count;
     public bool IsEmpty => _count == 0;
     public bool IsFull => _count == Capacity;
+
+    public bool Contains(T item)
+    {
+        if (IsEmpty)
+        {
+            return false;
+        }
+
+        var span = new ReadOnlySpan<T>(_buffer);
+
+        // Case 1: The items are in a single contiguous block: [_, _, T, T, H, _]
+        if (_tail < _head)
+        {
+            return Exists(span, _tail, _count, item);
+        }
+
+        // Case 2: The items are wrapped around the end of the buffer: [T, T, H, _, T]
+        // This also handles the case where the buffer is full (_head == _tail).
+
+        // We search the first segment (from the tail to the end of the buffer).
+        if (Exists(span, _tail, Capacity - _tail, item))
+        {
+            return true;
+        }
+
+        // Otherwise, we search the second segment (from the start of the buffer up to the head).
+        return Exists(span, 0, _head, item);
+
+        static bool Exists(ReadOnlySpan<T> buffer, int index, int segmentLength, T item)
+        {
+            var comparer = EqualityComparer<T>.Default;
+            var end = index + segmentLength;
+
+            for (int i = index; i < end; i++)
+            {
+                if (comparer.Equals(buffer[i], item))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
 
     public void Enqueue(T item)
     {

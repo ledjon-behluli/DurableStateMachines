@@ -14,6 +14,7 @@ public class DurableTimeWindowBufferTests(TestFixture fixture)
         Task<TimeSpan> GetWindow();
         Task<int> GetCount();
         Task<bool> IsEmpty();
+        Task<bool> Contains(string value);
         Task<List<string>> GetAll();
         Task<(int, string[])> CopyToArray(int arraySize, int arrayIndex);
         Task<(int, string[])> DrainToArray(int arraySize, int arrayIndex);
@@ -55,6 +56,7 @@ public class DurableTimeWindowBufferTests(TestFixture fixture)
         public Task<TimeSpan> GetWindow() => Task.FromResult(state.Window);
         public Task<int> GetCount() => Task.FromResult(state.Count);
         public Task<bool> IsEmpty() => Task.FromResult(state.IsEmpty);
+        public Task<bool> Contains(string value) => Task.FromResult(state.Contains(value));
         public Task<List<string>> GetAll() => Task.FromResult(state.ToList());
 
         public Task<(int, string[])> CopyToArray(int arraySize, int arrayIndex)
@@ -115,6 +117,35 @@ public class DurableTimeWindowBufferTests(TestFixture fixture)
         var items1 = await grain.GetAll();
         Assert.Equal("one", items1.First());
         Assert.Equal("two", items1.Last());
+    }
+
+    [Fact]
+    public async Task Contains()
+    {
+        var grain = GetGrain("contains");
+        await grain.SetWindow(TimeSpan.FromSeconds(10));
+
+        Assert.False(await grain.Contains("one"));
+
+        await grain.Enqueue("one"); // t=0
+        fixture.TimeProvider.Advance(TimeSpan.FromSeconds(5));
+        await grain.Enqueue("two"); // t=5
+
+        Assert.True(await grain.Contains("one"));
+        Assert.True(await grain.Contains("two"));
+        Assert.False(await grain.Contains("three"));
+
+        // Test after item expiration
+        fixture.TimeProvider.Advance(TimeSpan.FromSeconds(6)); // Time is now t=11. "one" is 11s old and expired.
+        await grain.Enqueue("three"); // Enqueue triggers purge. "one" is removed.
+
+        Assert.False(await grain.Contains("one"));
+        Assert.True(await grain.Contains("two"));
+        Assert.True(await grain.Contains("three"));
+
+        await grain.TryDequeue();
+        Assert.False(await grain.Contains("two"));
+        Assert.True(await grain.Contains("three"));
     }
 
     [Fact]

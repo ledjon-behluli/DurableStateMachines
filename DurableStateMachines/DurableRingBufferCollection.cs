@@ -408,6 +408,7 @@ internal sealed class DurableRingBufferCollection<TKey, TValue> :
         public bool IsEmpty => Buffer.IsEmpty;
         public bool IsFull => Buffer.IsFull;
 
+        public bool Contains(TValue item) => Buffer.Contains(item);
         public bool SetCapacity(int capacity) => collection.SetBufferCapacity(key, capacity);
         public void Enqueue(TValue item) => collection.EnqueueItem(key, item);
         public bool TryDequeue([MaybeNullWhen(false)] out TValue item) => collection.TryDequeueItem(key, out item);
