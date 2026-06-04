@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
@@ -106,208 +107,372 @@ public interface IDurableGraph<TNode, TEdge> :
     void Clear();
 }
 
-[DebuggerDisplay("Nodes = {Count}")]
-[DebuggerTypeProxy(typeof(DurableGraphDebugView<,>))]
-internal sealed class DurableGraph<TNode, TEdge> : IDurableGraph<TNode, TEdge>, IDurableStateMachine where TNode : notnull
+/// <summary>
+/// Receives decoded durable graph commands from a codec implementation.
+/// </summary>
+public interface IDurableGraphCommandHandler<TNode, TEdge>
+{
+    /// <summary>Applies an add node command.</summary>
+    void ApplyAddNode(TNode node);
+
+    /// <summary>Applies a remove node command.</summary>
+    void ApplyRemoveNode(TNode node);
+
+    /// <summary>Applies an add edge command.</summary>
+    void ApplyAddEdge(TNode source, TNode destination, TEdge edge);
+
+    /// <summary>Applies an upsert edge command.</summary>
+    void ApplyUpsertEdge(TNode source, TNode destination, TEdge edge);
+
+    /// <summary>Applies a remove edge command.</summary>
+    void ApplyRemoveEdge(TNode source, TNode destination);
+
+    /// <summary>Applies a clear command.</summary>
+    void ApplyClear();
+
+    /// <summary>Resets the receiver before applying replacement entries.</summary>
+    void Reset();
+}
+
+/// <summary>
+/// Serializes one durable graph command and applies one decoded command.
+/// </summary>
+public interface IDurableGraphCommandCodec<TNode, TEdge>
+{
+    /// <summary>Writes an add node command.</summary>
+    void WriteAddNode(TNode node, JournalStreamWriter writer);
+
+    /// <summary>Writes a remove node command.</summary>
+    void WriteRemoveNode(TNode node, JournalStreamWriter writer);
+
+    /// <summary>Writes an add edge command.</summary>
+    void WriteAddEdge(TNode source, TNode destination, TEdge edge, JournalStreamWriter writer);
+
+    /// <summary>Writes an upsert edge command.</summary>
+    void WriteUpsertEdge(TNode source, TNode destination, TEdge edge, JournalStreamWriter writer);
+
+    /// <summary>Writes a remove edge command.</summary>
+    void WriteRemoveEdge(TNode source, TNode destination, JournalStreamWriter writer);
+
+    /// <summary>Writes a clear command.</summary>
+    void WriteClear(JournalStreamWriter writer);
+
+    /// <summary>Writes a snapshot command.</summary>
+    void WriteSnapshot(IReadOnlyCollection<TNode> nodes, int edgeCount, IEnumerable<(TNode Source, TNode Destination, TEdge Edge)> edges, JournalStreamWriter writer);
+
+    /// <summary>Reads one encoded command and applies it to <paramref name="handler"/>.</summary>
+    void Apply(JournalBufferReader input, IDurableGraphCommandHandler<TNode, TEdge> handler);
+}
+
+internal sealed class DurableGraphCommandBinaryCodec<TNode, TEdge>(
+    IFieldCodec<TNode> nodeCodec, IFieldCodec<TEdge> edgeCodec, SerializerSessionPool sessionPool)
+        : IDurableGraphCommandCodec<TNode, TEdge>
 {
     private const byte VersionByte = 0;
 
-    private IStateMachineLogWriter? _storage;
-
-    private readonly SerializerSessionPool _sessionPool;
-    private readonly IFieldCodec<TNode> _nodeCodec;
-    private readonly IFieldCodec<TEdge> _edgeCodec;
-
-    private readonly Dictionary<TNode, NodeInfo> _nodes = [];
-
-    public DurableGraph(
-        [ServiceKey] string key, IStateMachineManager manager,
-        IFieldCodec<TNode> nodeCodec, IFieldCodec<TEdge> edgeCodec,
-        SerializerSessionPool sessionPool)
+    private enum CommandType : uint
     {
-        ArgumentException.ThrowIfNullOrEmpty(key);
-
-        _nodeCodec = nodeCodec;
-        _edgeCodec = edgeCodec;
-        _sessionPool = sessionPool;
-
-        manager.RegisterStateMachine(key, this);
+        Clear = 0,
+        Snapshot = 1,
+        AddNode = 2,
+        RemoveNode = 3,
+        AddEdge = 4,
+        UpsertEdge = 5,
+        RemoveEdge = 6
     }
 
-    public int Count => _nodes.Count;
-    public IReadOnlyCollection<TNode> Nodes => _nodes.Keys;
-
-    void IDurableStateMachine.AppendEntries(StateMachineStorageWriter writer) 
+    public void WriteAddNode(TNode node, JournalStreamWriter writer)
     {
-        // We use a push model, and appened entries upon modification.
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.AddNode);
+
+        nodeCodec.WriteField(ref payloadWriter, 0, typeof(TNode), node);
+
+        payloadWriter.Commit();
+        entry.Commit();
     }
 
-    void IDurableStateMachine.Reset(IStateMachineLogWriter storage)
+    public void WriteRemoveNode(TNode node, JournalStreamWriter writer)
     {
-        ApplyClear();
-        _storage = storage;
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.RemoveNode);
+
+        nodeCodec.WriteField(ref payloadWriter, 0, typeof(TNode), node);
+
+        payloadWriter.Commit();
+        entry.Commit();
     }
 
-    void IDurableStateMachine.Apply(ReadOnlySequence<byte> logEntry)
+    public void WriteAddEdge(TNode source, TNode destination, TEdge edge, JournalStreamWriter writer)
     {
-        using var session = _sessionPool.GetSession();
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
 
-        var reader = Reader.Create(logEntry, session);
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.AddEdge);
+
+        nodeCodec.WriteField(ref payloadWriter, 0, typeof(TNode), source);
+        nodeCodec.WriteField(ref payloadWriter, 1, typeof(TNode), destination);
+        edgeCodec.WriteField(ref payloadWriter, 2, typeof(TEdge), edge);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteUpsertEdge(TNode source, TNode destination, TEdge edge, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.UpsertEdge);
+
+        nodeCodec.WriteField(ref payloadWriter, 0, typeof(TNode), source);
+        nodeCodec.WriteField(ref payloadWriter, 1, typeof(TNode), destination);
+        edgeCodec.WriteField(ref payloadWriter, 2, typeof(TEdge), edge);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteRemoveEdge(TNode source, TNode destination, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.RemoveEdge);
+
+        nodeCodec.WriteField(ref payloadWriter, 0, typeof(TNode), source);
+        nodeCodec.WriteField(ref payloadWriter, 1, typeof(TNode), destination);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteClear(JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Clear);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteSnapshot(IReadOnlyCollection<TNode> nodes, int edgeCount, IEnumerable<(TNode Source, TNode Destination, TEdge Edge)> edges, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Snapshot);
+
+        // The snapshot format is the list of all nodes, followed by the list of all edges.
+        // This strategy avoids complex traversal logic for graphs, which can
+        // contain cycles or consist of multiple, disconnected components.
+
+        // First, write the count of all nodes, followed by each node's value.
+        payloadWriter.WriteVarUInt32((uint)nodes.Count);
+
+        foreach (var node in nodes)
+        {
+            nodeCodec.WriteField(ref payloadWriter, 0, typeof(TNode), node);
+        }
+
+        // Next, calculate and write the total number of edges.
+        payloadWriter.WriteVarUInt32((uint)edgeCount);
+
+        // Finally, iterate through every outgoing edge in the graph and write it as a (source, dest, edge) triplet.
+        foreach (var (source, dest, edge) in edges)
+        {
+            nodeCodec.WriteField(ref payloadWriter, 0, typeof(TNode), source);
+            nodeCodec.WriteField(ref payloadWriter, 1, typeof(TNode), dest);
+            edgeCodec.WriteField(ref payloadWriter, 2, typeof(TEdge), edge);
+        }
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void Apply(JournalBufferReader input, IDurableGraphCommandHandler<TNode, TEdge> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+
+        using var slice = input.Peek(input.Length);
+        using var session = sessionPool.GetSession();
+
+        var reader = Reader.Create(slice, session);
         var version = reader.ReadByte();
 
         if (version != VersionByte)
         {
-            throw new NotSupportedException($"This instance of {nameof(DurableGraph<TNode, TEdge>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
+            throw new NotSupportedException($"This command codec supports version {(uint)VersionByte} and not version {(uint)version}.");
         }
 
         var command = (CommandType)reader.ReadVarUInt32();
 
         switch (command)
         {
-            case CommandType.AddNode: _ = ApplyAddNode(ReadNode(ref reader)); break;
-            case CommandType.RemoveNode: _ = ApplyRemoveNode(ReadNode(ref reader)); break;
-            case CommandType.AddEdge: _ = ApplyAddEdge(ReadNode(ref reader), ReadNode(ref reader), ReadEdge(ref reader)); break;
-            case CommandType.UpsertEdge: ApplyUpsertEdge(ReadNode(ref reader), ReadNode(ref reader), ReadEdge(ref reader)); break;
-            case CommandType.RemoveEdge: _ = ApplyRemoveEdge(ReadNode(ref reader), ReadNode(ref reader)); break;
-            case CommandType.Clear: ApplyClear(); break;
-            case CommandType.Snapshot: ApplySnapshot(ref reader); break;
-            default: throw new NotSupportedException($"Command type {command} is not supported");
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        TNode ReadNode(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var field = reader.ReadFieldHeader();
-            return _nodeCodec.ReadValue(ref reader, field);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        TEdge ReadEdge(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var field = reader.ReadFieldHeader();
-            return _edgeCodec.ReadValue(ref reader, field);
-        }
-
-        void ApplySnapshot(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            ApplyClear();
-
-            // First, read the node count and reconstruct all nodes. This ensures that when we
-            // process the edges in the next step, both source and destination nodes will already exist.
-            var nodeCount = (int)reader.ReadVarUInt32();
-
-            for (var i = 0; i < nodeCount; i++)
-            {
-                ApplyAddNode(ReadNode(ref reader));
-            }
-
-            // Next, read the edge count and reconstruct all edges,
-            // linking the nodes that were created in the previous step.
-            var edgeCount = (int)reader.ReadVarUInt32();
-
-            for (var i = 0; i < edgeCount; i++)
-            {
-                var source = ReadNode(ref reader);
-                var destination = ReadNode(ref reader);
-                var edge = ReadEdge(ref reader);
-
-                ApplyAddEdge(source, destination, edge);
-            }
-        }
-    }
-
-    void IDurableStateMachine.AppendSnapshot(StateMachineStorageWriter writer)
-    {
-        writer.AppendEntry(static (self, bufferWriter) =>
-        {
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)CommandType.Snapshot);
-
-            // The snapshot format is the list of all nodes, followed by the list of all edges.
-            // This strategy avoids complex traversal logic for graphs, which can
-            // contain cycles or consist of multiple, disconnected components.
-
-            // First, write the count of all nodes, followed by each node's value.
-            writer.WriteVarUInt32((uint)self._nodes.Count);
-
-            foreach (var node in self._nodes.Keys)
-            {
-                self._nodeCodec.WriteField(ref writer, 0, typeof(TNode), node);
-            }
-
-            // Next, calculate and write the total number of edges.
-            var edgeCount = self._nodes.Values.Sum(n => n.Outgoing.Count);
-            writer.WriteVarUInt32((uint)edgeCount);
-
-            // Finally, iterate through every outgoing edge in the graph and write it as a (source, dest, edge) triplet.
-            foreach (var (source, nodeInfo) in self._nodes)
-            {
-                foreach (var (destination, edge) in nodeInfo.Outgoing)
+            case CommandType.AddNode: handler.ApplyAddNode(ReadNode(ref reader)); break;
+            case CommandType.RemoveNode: handler.ApplyRemoveNode(ReadNode(ref reader)); break;
+            case CommandType.AddEdge: handler.ApplyAddEdge(ReadNode(ref reader), ReadNode(ref reader), ReadEdge(ref reader)); break;
+            case CommandType.UpsertEdge: handler.ApplyUpsertEdge(ReadNode(ref reader), ReadNode(ref reader), ReadEdge(ref reader)); break;
+            case CommandType.RemoveEdge: handler.ApplyRemoveEdge(ReadNode(ref reader), ReadNode(ref reader)); break;
+            case CommandType.Clear: handler.ApplyClear(); break;
+            case CommandType.Snapshot:
                 {
-                    self._nodeCodec.WriteField(ref writer, 0, typeof(TNode), source);
-                    self._nodeCodec.WriteField(ref writer, 1, typeof(TNode), destination);
-                    self._edgeCodec.WriteField(ref writer, 2, typeof(TEdge), edge);
-                }
-            }
+                    handler.Reset();
 
-            writer.Commit();
-        }, this);
+                    // First, read the node count and reconstruct all nodes. This ensures that when we
+                    // process the edges in the next step, both source and destination nodes will already exist.
+                    var nodeCount = (int)reader.ReadVarUInt32();
+                    for (var i = 0; i < nodeCount; i++)
+                    {
+                        handler.ApplyAddNode(ReadNode(ref reader));
+                    }
+
+                    // Next, read the edge count and reconstruct all edges,
+                    // linking the nodes that were created in the previous step.
+                    var edgeCount = (int)reader.ReadVarUInt32();
+                    for (var i = 0; i < edgeCount; i++)
+                    {
+                        var source = ReadNode(ref reader);
+                        var destination = ReadNode(ref reader);
+                        var edge = ReadEdge(ref reader);
+
+                        handler.ApplyAddEdge(source, destination, edge);
+                    }
+                }
+                break;
+            default: Helpers.ThrowUnsupportedCommand(command); break;
+        }
+
+        Helpers.ThrowIfTrailingData(ref reader);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        TNode ReadNode<TInput>(ref Reader<TInput> reader)
+        {
+            var field = reader.ReadFieldHeader();
+            return nodeCodec.ReadValue(ref reader, field);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        TEdge ReadEdge<TInput>(ref Reader<TInput> reader)
+        {
+            var field = reader.ReadFieldHeader();
+            return edgeCodec.ReadValue(ref reader, field);
+        }
     }
+}
+
+[DebuggerDisplay("Nodes = {Count}")]
+internal sealed class DurableGraph<TNode, TEdge> :
+    IDurableGraph<TNode, TEdge>,
+    IDurableGraphCommandHandler<TNode, TEdge>,
+    IJournaledState
+        where TNode : notnull
+{
+    private JournalStreamWriter? _writer;
+    private readonly Dictionary<TNode, NodeInfo> _nodes = [];
+    private readonly IDurableGraphCommandCodec<TNode, TEdge> _codec;
+
+    public DurableGraph(
+        [ServiceKey] string key, IJournaledStateManager manager,
+        IOptions<JournaledStateManagerOptions> options, IServiceProvider serviceProvider)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        _codec = Helpers.GetCodec<IDurableGraphCommandCodec<TNode, TEdge>>(serviceProvider, options);
+        manager.RegisterState(key, this);
+    }
+
+    public int Count => _nodes.Count;
+    public IReadOnlyCollection<TNode> Nodes => _nodes.Keys;
+
+    #region IJournalState
+
+    IJournaledState IJournaledState.DeepCopy() => throw new NotImplementedException();
+
+    void IJournaledState.ReplayEntry(JournalEntry entry, JournalReplayContext context) =>
+        context.GetRequiredCommandCodec(entry.FormatKey, _codec).Apply(entry.Reader, this);
+
+    void IJournaledState.AppendEntries(JournalStreamWriter writer)
+    {
+        // We use a push model, and append entries upon modification.
+    }
+
+    void IJournaledState.AppendSnapshot(JournalStreamWriter snapshotWriter)
+    {
+        var edgeCount = _nodes.Values.Sum(n => n.Outgoing.Count);
+        _codec.WriteSnapshot(Nodes, edgeCount, GetEdges(), snapshotWriter);
+    }
+
+    void IJournaledState.Reset(JournalStreamWriter writer)
+    {
+        ApplyClear();
+        _writer = writer;
+    }
+
+    #endregion
+
+    #region IDurableGraphCommandHandler
+
+    void IDurableGraphCommandHandler<TNode, TEdge>.ApplyAddNode(TNode node) => ApplyAddNode(node);
+    void IDurableGraphCommandHandler<TNode, TEdge>.ApplyRemoveNode(TNode node) => ApplyRemoveNode(node);
+    void IDurableGraphCommandHandler<TNode, TEdge>.ApplyAddEdge(TNode source, TNode destination, TEdge edge) => ApplyAddEdge(source, destination, edge);
+    void IDurableGraphCommandHandler<TNode, TEdge>.ApplyUpsertEdge(TNode source, TNode destination, TEdge edge) => ApplyUpsertEdge(source, destination, edge);
+    void IDurableGraphCommandHandler<TNode, TEdge>.ApplyRemoveEdge(TNode source, TNode destination) => ApplyRemoveEdge(source, destination);
+    void IDurableGraphCommandHandler<TNode, TEdge>.ApplyClear() => ApplyClear();
+    void IDurableGraphCommandHandler<TNode, TEdge>.Reset() => ApplyClear();
+
+    #endregion
 
     public bool AddNode(TNode node)
     {
-        if (ApplyAddNode(node))
+        if (_nodes.ContainsKey(node))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, node) = state;
-
-                using var session = self._sessionPool.GetSession();
-                
-                var writer = Writer.Create(bufferWriter, session);
-                
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-                
-                self._nodeCodec.WriteField(ref writer, 0, typeof(TNode), node);
-                
-                writer.Commit();
-            }, (this, CommandType.AddNode, node));
-
-            return true;
+            return false;
         }
 
-        return false;
+        _codec.WriteAddNode(node, GetWriter());
+        ApplyAddNode(node);
+
+        return true;
     }
 
     public bool RemoveNode(TNode node)
     {
-        if (ApplyRemoveNode(node))
+        if (!_nodes.ContainsKey(node))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, node) = state;
-                
-                using var session = self._sessionPool.GetSession();
-                
-                var writer = Writer.Create(bufferWriter, session);
-                
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-                
-                self._nodeCodec.WriteField(ref writer, 0, typeof(TNode), node);
-                
-                writer.Commit();
-            }, (this, CommandType.RemoveNode, node));
-            
-            return true;
+            return false;
         }
 
-        return false;
+        _codec.WriteRemoveNode(node, GetWriter());
+        ApplyRemoveNode(node);
+
+        return true;
     }
 
     public bool AddEdge(TNode source, TNode destination, TEdge edge)
@@ -322,30 +487,15 @@ internal sealed class DurableGraph<TNode, TEdge> : IDurableGraph<TNode, TEdge>, 
             throw new ArgumentException("The destination node does not exist.", nameof(destination));
         }
 
-        if (ApplyAddEdge(source, destination, edge))
+        if (_nodes[source].Outgoing.ContainsKey(destination))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, src, dest, edge) = state;
-                
-                using var session = self._sessionPool.GetSession();
-                
-                var writer = Writer.Create(bufferWriter, session);
-                
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-                
-                self._nodeCodec.WriteField(ref writer, 0, typeof(TNode), src);
-                self._nodeCodec.WriteField(ref writer, 1, typeof(TNode), dest);
-                self._edgeCodec.WriteField(ref writer, 2, typeof(TEdge), edge);
-                
-                writer.Commit();
-            }, (this, CommandType.AddEdge, source, destination, edge));
-
-            return true;
+            return false;
         }
 
-        return false;
+        _codec.WriteAddEdge(source, destination, edge, GetWriter());
+        ApplyAddEdge(source, destination, edge);
+
+        return true;
     }
 
     public void UpsertEdge(TNode source, TNode destination, TEdge edge)
@@ -361,74 +511,36 @@ internal sealed class DurableGraph<TNode, TEdge> : IDurableGraph<TNode, TEdge>, 
         }
 
         // Since validations passed, the upsert will always succeed:
+        // - If the edge does not exist, it is created.
+        // - If the edge exists with a different value, it is updated.
+        // - If the edge exists with the exact same value, it is overwritten with that same value.
 
-        // If the edge does not exist, it is created.
-        // If the edge exists with a different value, it is updated.
-        // If the edge exists with the exact same value, it is overwritten with that same value.
-
+        _codec.WriteUpsertEdge(source, destination, edge, GetWriter());
         ApplyUpsertEdge(source, destination, edge);
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            var (self, cmd, src, dest, edge) = state;
-            
-            using var session = self._sessionPool.GetSession();
-            
-            var writer = Writer.Create(bufferWriter, session);
-            
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-            
-            self._nodeCodec.WriteField(ref writer, 0, typeof(TNode), src);
-            self._nodeCodec.WriteField(ref writer, 1, typeof(TNode), dest);
-            self._edgeCodec.WriteField(ref writer, 2, typeof(TEdge), edge);
-            
-            writer.Commit();
-        }, (this, CommandType.UpsertEdge, source, destination, edge));
     }
 
     public bool RemoveEdge(TNode source, TNode destination)
     {
-        if (ApplyRemoveEdge(source, destination))
+        if (!_nodes.TryGetValue(source, out var sourceInfo) || !sourceInfo.Outgoing.ContainsKey(destination))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, src, dest) = state;
-                
-                using var session = self._sessionPool.GetSession();
-                
-                var writer = Writer.Create(bufferWriter, session);
-                
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-                
-                self._nodeCodec.WriteField(ref writer, 0, typeof(TNode), src);
-                self._nodeCodec.WriteField(ref writer, 1, typeof(TNode), dest);
-                
-                writer.Commit();
-            }, (this, CommandType.RemoveEdge, source, destination));
-         
-            return true;
+            return false;
         }
 
-        return false;
+        _codec.WriteRemoveEdge(source, destination, GetWriter());
+        ApplyRemoveEdge(source, destination);
+
+        return true;
     }
 
     public void Clear()
     {
-        ApplyClear();
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
+        if (_nodes.Count == 0)
         {
-            var (self, cmd) = state;
-           
-            using var session = self._sessionPool.GetSession();
-            
-            var writer = Writer.Create(bufferWriter, session);
-            
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-            
-            writer.Commit();
-        }, (this, CommandType.Clear));
+            return;
+        }
+
+        _codec.WriteClear(GetWriter());
+        ApplyClear();
     }
 
     public bool ContainsNode(TNode node) => _nodes.ContainsKey(node);
@@ -442,7 +554,7 @@ internal sealed class DurableGraph<TNode, TEdge> : IDurableGraph<TNode, TEdge>, 
         }
 
         edge = default;
-        
+
         return false;
     }
 
@@ -490,13 +602,13 @@ internal sealed class DurableGraph<TNode, TEdge> : IDurableGraph<TNode, TEdge>, 
         return result;
     }
 
-    private bool ApplyAddNode(TNode node) => _nodes.TryAdd(node, new NodeInfo());
+    private void ApplyAddNode(TNode node) => _nodes.TryAdd(node, new NodeInfo());
 
-    private bool ApplyRemoveNode(TNode node)
+    private void ApplyRemoveNode(TNode node)
     {
         if (!_nodes.Remove(node, out var nodeInfo))
         {
-            return false;
+            return;
         }
 
         foreach (var destination in nodeInfo.Outgoing.Keys)
@@ -514,11 +626,9 @@ internal sealed class DurableGraph<TNode, TEdge> : IDurableGraph<TNode, TEdge>, 
                 sourceInfo.Outgoing.Remove(node);
             }
         }
-
-        return true;
     }
 
-    private bool ApplyAddEdge(TNode source, TNode destination, TEdge edge)
+    private void ApplyAddEdge(TNode source, TNode destination, TEdge edge)
     {
         if (_nodes.TryGetValue(source, out var sourceInfo) &&
             _nodes.TryGetValue(destination, out var destinationInfo))
@@ -526,11 +636,8 @@ internal sealed class DurableGraph<TNode, TEdge> : IDurableGraph<TNode, TEdge>, 
             if (sourceInfo.Outgoing.TryAdd(destination, edge))
             {
                 destinationInfo.Incoming.Add(source);
-                return true;
             }
         }
-
-        return false;
     }
 
     private void ApplyUpsertEdge(TNode source, TNode destination, TEdge edge)
@@ -539,7 +646,7 @@ internal sealed class DurableGraph<TNode, TEdge> : IDurableGraph<TNode, TEdge>, 
         _nodes[destination].Incoming.Add(source);
     }
 
-    private bool ApplyRemoveEdge(TNode source, TNode destination)
+    private void ApplyRemoveEdge(TNode source, TNode destination)
     {
         if (_nodes.TryGetValue(source, out var sourceInfo) &&
             _nodes.TryGetValue(destination, out var destinationInfo))
@@ -547,39 +654,34 @@ internal sealed class DurableGraph<TNode, TEdge> : IDurableGraph<TNode, TEdge>, 
             if (sourceInfo.Outgoing.Remove(destination))
             {
                 destinationInfo.Incoming.Remove(source);
-                return true;
             }
         }
-
-        return false;
     }
 
     private void ApplyClear() => _nodes.Clear();
 
-    private IStateMachineLogWriter GetStorage()
+    private IEnumerable<(TNode Source, TNode Destination, TEdge Edge)> GetEdges()
     {
-        Debug.Assert(_storage is not null);
-        return _storage;
+        foreach (var (source, nodeInfo) in _nodes)
+        {
+            foreach (var (destination, edge) in nodeInfo.Outgoing)
+            {
+                yield return (source, destination, edge);
+            }
+        }
     }
 
-    public IDurableStateMachine DeepCopy() => throw new NotImplementedException();
+    private JournalStreamWriter GetWriter()
+    {
+        Debug.Assert(_writer.HasValue);
+        return _writer.Value;
+    }
 
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 
     public IEnumerator<(TNode Node, IReadOnlyCollection<(TNode Destination, TEdge Edge)> OutgoingEdges)> GetEnumerator() =>
         _nodes.Select(kvp => (kvp.Key, (IReadOnlyCollection<(TNode, TEdge)>)
             kvp.Value.Outgoing.Select(e => (e.Key, e.Value)).ToList())).GetEnumerator();
-
-    private enum CommandType : uint
-    {
-        Clear = 0,
-        Snapshot = 1,
-        AddNode = 2,
-        RemoveNode = 3,
-        AddEdge = 4,
-        UpsertEdge = 5,
-        RemoveEdge = 6
-    }
 
     private sealed class NodeInfo
     {

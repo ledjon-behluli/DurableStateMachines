@@ -34,6 +34,23 @@ public static class HostingExtensions
         services.TryAddKeyedScoped(typeof(IDurableTimeWindowBuffer<>), KeyedService.AnyKey, typeof(DurableTimeWindowBuffer<>));
         services.TryAddKeyedScoped(typeof(IDurableTimeWindowBufferCollection<,>), KeyedService.AnyKey, typeof(DurableTimeWindowBufferCollection<,>));
 
+        const string BinaryFormatKey = "orleans-binary";
+
+        services.TryAddKeyedSingleton(typeof(IDurableStackCommandCodec<>), BinaryFormatKey, typeof(DurableStackCommandBinaryCodec<>));
+        services.TryAddKeyedSingleton(typeof(IDurablePriorityQueueCommandCodec<,>), BinaryFormatKey, typeof(DurablePriorityQueueCommandCodec<,>));
+        services.TryAddKeyedSingleton(typeof(IDurableListLookupCommandCodec<,>), BinaryFormatKey, typeof(DurableListLookupCommandBinaryCodec<,>));
+        services.TryAddKeyedSingleton(typeof(IDurableSetLookupCommandCodec<,>), BinaryFormatKey, typeof(DurableSetLookupCommandBinaryCodec<,>));
+        services.TryAddKeyedSingleton(typeof(IDurableTreeCommandCodec<>), BinaryFormatKey, typeof(DurableTreeCommandBinaryCodec<>));
+        services.TryAddKeyedSingleton(typeof(IDurableGraphCommandCodec<,>), BinaryFormatKey, typeof(DurableGraphCommandBinaryCodec<,>));
+        services.TryAddKeyedSingleton(typeof(IDurableCancellationTokenSourceCommandCodec), BinaryFormatKey, typeof(DurableCancellationTokenSourceCommandBinaryCodec));
+        services.TryAddKeyedSingleton(typeof(IDurableObjectCommandCodec<>), BinaryFormatKey, typeof(DurableObjectCommandBinaryCodec<>));
+        services.TryAddKeyedSingleton(typeof(IDurableOrderedSetCommandCodec<>), BinaryFormatKey, typeof(DurableOrderedSetCommandBinaryCodec<>));
+        services.TryAddKeyedSingleton(typeof(IDurableOrderedSetLookupCommandCodec<,>), BinaryFormatKey, typeof(DurableOrderedSetLookupCommandBinaryCodec<,>));
+        services.TryAddKeyedSingleton(typeof(IDurableRingBufferCommandCodec<>), BinaryFormatKey, typeof(DurableRingBufferCommandBinaryCodec<>));
+        services.TryAddKeyedSingleton(typeof(IDurableRingBufferCollectionCommandCodec<,>), BinaryFormatKey, typeof(DurableRingBufferCollectionCommandBinaryCodec<,>));
+        services.TryAddKeyedSingleton(typeof(IDurableTimeWindowBufferCommandCodec<>), BinaryFormatKey, typeof(DurableTimeWindowBufferCommandBinaryCodec<>));
+        services.TryAddKeyedSingleton(typeof(IDurableTimeWindowBufferCollectionCommandCodec<,>), BinaryFormatKey, typeof(DurableTimeWindowBufferCollectionCommandBinaryCodec<,>));
+
         return services;
     }
 }

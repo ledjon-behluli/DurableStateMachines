@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
@@ -91,163 +92,317 @@ public interface IDurableTree<T> : IEnumerable<T>, IReadOnlyCollection<T> where 
     void Clear();
 }
 
-[DebuggerDisplay("Count = {Count}, IsEmpty = {IsEmpty}")]
-[DebuggerTypeProxy(typeof(DurableTreeDebugView<>))]
-internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine where T : notnull
+/// <summary>
+/// Receives decoded durable tree commands from a codec implementation.
+/// </summary>
+public interface IDurableTreeCommandHandler<T>
+{
+    /// <summary>Applies a set root command.</summary>
+    void ApplySetRoot(T root);
+
+    /// <summary>Applies an add command.</summary>
+    void ApplyAdd(T parent, T value);
+
+    /// <summary>Applies a remove command.</summary>
+    void ApplyRemove(T value);
+
+    /// <summary>Applies a move command.</summary>
+    void ApplyMove(T value, T parent);
+
+    /// <summary>Applies a clear command.</summary>
+    void ApplyClear();
+
+    /// <summary>Resets the receiver before applying replacement entries.</summary>
+    void Reset();
+}
+
+/// <summary>
+/// Serializes one durable tree command and applies one decoded command.
+/// </summary>
+public interface IDurableTreeCommandCodec<T>
+{
+    /// <summary>Writes a set root command.</summary>
+    void WriteSetRoot(T root, JournalStreamWriter writer);
+
+    /// <summary>Writes an add command.</summary>
+    void WriteAdd(T parent, T value, JournalStreamWriter writer);
+
+    /// <summary>Writes a remove command.</summary>
+    void WriteRemove(T value, JournalStreamWriter writer);
+
+    /// <summary>Writes a move command.</summary>
+    void WriteMove(T value, T parent, JournalStreamWriter writer);
+
+    /// <summary>Writes a clear command.</summary>
+    void WriteClear(JournalStreamWriter writer);
+
+    /// <summary>Writes a snapshot command.</summary>
+    void WriteSnapshot(int count, T root, IEnumerable<(T Child, T Parent)> edges, JournalStreamWriter writer);
+
+    /// <summary>Reads one encoded command and applies it to <paramref name="handler"/>.</summary>
+    void Apply(JournalBufferReader input, IDurableTreeCommandHandler<T> handler);
+}
+
+internal sealed class DurableTreeCommandBinaryCodec<T>(
+    IFieldCodec<T> codec, SerializerSessionPool sessionPool) : IDurableTreeCommandCodec<T>
 {
     private const byte VersionByte = 0;
 
-    private IStateMachineLogWriter? _storage;
-
-    private readonly SerializerSessionPool _sessionPool;
-    private readonly IFieldCodec<T> _valueCodec;
-
-    private T? _root;
-    private readonly Dictionary<T, Node> _nodes = [];
-
-    public DurableTree(
-        [ServiceKey] string key, IStateMachineManager manager,
-        IFieldCodec<T> valueCodec, SerializerSessionPool sessionPool)
+    private enum CommandType : uint
     {
-        ArgumentException.ThrowIfNullOrEmpty(key);
-
-        _valueCodec = valueCodec;
-        _sessionPool = sessionPool;
-
-        manager.RegisterStateMachine(key, this);
+        Clear = 0,
+        Snapshot = 1,
+        Add = 2,
+        Remove = 3,
+        Move = 4,
+        SetRoot = 5,
     }
 
-    public int Count => _nodes.Count;
-    public bool IsEmpty => _root is null;
-    public T Root => _root ?? throw new InvalidOperationException("The tree is empty.");
-
-    void IDurableStateMachine.AppendEntries(StateMachineStorageWriter writer)
+    public void WriteSetRoot(T root, JournalStreamWriter writer)
     {
-        // We use a push model, and appened entries upon modification.
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.SetRoot);
+
+        codec.WriteField(ref payloadWriter, 0, typeof(T), root);
+
+        payloadWriter.Commit();
+        entry.Commit();
     }
 
-    void IDurableStateMachine.Reset(IStateMachineLogWriter storage)
+    public void WriteAdd(T parent, T value, JournalStreamWriter writer)
     {
-        ApplyClear();
-        _storage = storage;
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Add);
+
+        codec.WriteField(ref payloadWriter, 0, typeof(T), parent);
+        codec.WriteField(ref payloadWriter, 1, typeof(T), value);
+
+        payloadWriter.Commit();
+        entry.Commit();
     }
 
-    void IDurableStateMachine.Apply(ReadOnlySequence<byte> logEntry)
+    public void WriteRemove(T value, JournalStreamWriter writer)
     {
-        using var session = _sessionPool.GetSession();
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
 
-        var reader = Reader.Create(logEntry, session);
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Remove);
+
+        codec.WriteField(ref payloadWriter, 0, typeof(T), value);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteMove(T value, T parent, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Move);
+
+        codec.WriteField(ref payloadWriter, 0, typeof(T), value);
+        codec.WriteField(ref payloadWriter, 1, typeof(T), parent);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteClear(JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Clear);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteSnapshot(int count, T root, IEnumerable<(T Child, T Parent)> edges, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Snapshot);
+
+        payloadWriter.WriteVarUInt32((uint)count);
+
+        if (count > 0)
+        {
+            // The root is a special node, so we always write it first.
+            codec.WriteField(ref payloadWriter, 0, typeof(T), root);
+
+            foreach (var (child, parent) in edges)
+            {
+                // For each child found, we write the (child, parent) pair.
+                // The 'parent' is the 'current' node from the queue.
+
+                codec.WriteField(ref payloadWriter, 0, typeof(T), child);
+                codec.WriteField(ref payloadWriter, 1, typeof(T), parent);
+            }
+        }
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void Apply(JournalBufferReader input, IDurableTreeCommandHandler<T> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+
+        using var slice = input.Peek(input.Length);
+        using var session = sessionPool.GetSession();
+
+        var reader = Reader.Create(slice, session);
         var version = reader.ReadByte();
 
         if (version != VersionByte)
         {
-            throw new NotSupportedException($"This instance of {nameof(DurableTree<T>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
+            throw new NotSupportedException($"This command codec supports version {(uint)VersionByte} and not version {(uint)version}.");
         }
 
         var command = (CommandType)reader.ReadVarUInt32();
 
         switch (command)
         {
-            case CommandType.SetRoot: ApplySetRoot(ReadValue(ref reader)); break;
-            case CommandType.Add: ApplyAdd(ReadValue(ref reader), ReadValue(ref reader)); break;
-            case CommandType.Remove: _ = ApplyRemove(ReadValue(ref reader)); break;
-            case CommandType.Move: _ = ApplyMove(ReadValue(ref reader), ReadValue(ref reader)); break;
-            case CommandType.Clear: ApplyClear(); break;
-            case CommandType.Snapshot: ApplySnapshot(ref reader); break;
-            default: throw new NotSupportedException($"Command type {command} is not supported");
+            case CommandType.SetRoot: handler.ApplySetRoot(ReadValue(ref reader)); break;
+            case CommandType.Add: handler.ApplyAdd(ReadValue(ref reader), ReadValue(ref reader)); break;
+            case CommandType.Remove: handler.ApplyRemove(ReadValue(ref reader)); break;
+            case CommandType.Move: handler.ApplyMove(ReadValue(ref reader), ReadValue(ref reader)); break;
+            case CommandType.Clear: handler.ApplyClear(); break;
+            case CommandType.Snapshot:
+                {
+                    var count = (int)reader.ReadVarUInt32();
+
+                    handler.Reset();
+
+                    if (count == 0)
+                    {
+                        break;
+                    }
+
+                    // Because of the level-order guarantee (Breadth-First Search),
+                    // the very first item in the snapshot is always the root node.
+
+                    var root = ReadValue(ref reader);
+                    handler.ApplySetRoot(root);
+
+                    for (var i = 1; i < count; i++)
+                    {
+                        // Parent can not be null here, because we are 100% certain the parent node was
+                        // processed in a previous iteration (or was the root) and already exists in _nodes.
+
+                        var child = ReadValue(ref reader);
+                        var parent = ReadValue(ref reader);
+
+                        handler.ApplyAdd(parent, child);
+                    }
+                }
+                break;
+            default: Helpers.ThrowUnsupportedCommand(command); break;
         }
+
+        Helpers.ThrowIfTrailingData(ref reader);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        T ReadValue(ref Reader<ReadOnlySequenceInput> reader)
+        T ReadValue<TInput>(ref Reader<TInput> reader)
         {
             var field = reader.ReadFieldHeader();
-            return _valueCodec.ReadValue(ref reader, field);
-        }
-
-        void ApplySnapshot(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            ApplyClear();
-
-            var count = (int)reader.ReadVarUInt32();
-            if (count == 0)
-            {
-                return;
-            }
-
-            // Because of the level-order guarantee (Breadth-First Search),
-            // the very first item in the snapshot is always the root node.
-
-            var root = ReadValue(ref reader);
-            ApplySetRoot(root);
-
-            for (var i = 1; i < count; i++)
-            {
-                // Parent can not be null here, because we are 100% certain the parent node was
-                // processed in a previous iteration (or was the root) and already exists in _nodes.
-
-                var child = ReadValue(ref reader);
-                var parent = ReadValue(ref reader);
-
-                ApplyAdd(parent, child);
-            }
+            return codec.ReadValue(ref reader, field);
         }
     }
+}
 
-    void IDurableStateMachine.AppendSnapshot(StateMachineStorageWriter writer)
+[DebuggerDisplay("Count = {Count}, IsEmpty = {IsEmpty}")]
+internal sealed class DurableTree<T> :
+    IDurableTree<T>,
+    IDurableTreeCommandHandler<T>,
+    IJournaledState
+        where T : notnull
+{
+    private JournalStreamWriter? _writer;
+    private T? _root;
+    private readonly Dictionary<T, Node> _nodes = [];
+    private readonly IDurableTreeCommandCodec<T> _codec;
+
+    public DurableTree(
+        [ServiceKey] string key, IJournaledStateManager manager,
+        IOptions<JournaledStateManagerOptions> options, IServiceProvider serviceProvider)
     {
-        writer.AppendEntry(static (self, bufferWriter) =>
-        {
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)CommandType.Snapshot);
-
-            var nodeCount = self.Count;
-            writer.WriteVarUInt32((uint)nodeCount);
-
-            if (nodeCount == 0)
-            {
-                writer.Commit();
-                return;
-            }
-
-            // The root is a special node, so we always write it first.
-            self._valueCodec.WriteField(ref writer, 0, typeof(T), self.Root);
-
-            // We use BFS (Breadth-First Search) to serialize all other nodes, guaranteeing parent-before-child order.
-            // We need to serialize the tree into a flat, linear stream of bytes. To rebuild it correctly, a parent node
-            // must always be processed before its children. If we process a child first, the ApplySnapshot method will fail
-            // when it tries to link that child to a parent that does not exist yet in the reconstructed tree.
-
-            using var queue = new ValueQueue();
-
-            queue.Enqueue(self.Root);
-
-            // We can skip the first item (the root) because we already wrote it.
-            // The queue's purpose now is purely to enforce the correct processing order for children.
-
-            while (queue.TryDequeue(out var current))
-            {
-                var node = self._nodes[current];
-
-                foreach (var child in node.Children)
-                {
-                    // For each child found, we write the (child, parent) pair.
-                    // The 'parent' is the 'current' node from the queue.
-
-                    self._valueCodec.WriteField(ref writer, 0, typeof(T), child);
-                    self._valueCodec.WriteField(ref writer, 1, typeof(T), current);
-
-                    // We add the child to the queue so its own children will be processed afterwards.
-                    queue.Enqueue(child);
-                }
-            }
-
-            writer.Commit();
-        }, this);
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        _codec = Helpers.GetCodec<IDurableTreeCommandCodec<T>>(serviceProvider, options);
+        manager.RegisterState(key, this);
     }
+
+    public int Count => _nodes.Count;
+    public bool IsEmpty => _root is null;
+    public T Root => _root ?? throw new InvalidOperationException("The tree is empty.");
+
+    #region IJournalState
+
+    IJournaledState IJournaledState.DeepCopy() => throw new NotImplementedException();
+
+    void IJournaledState.ReplayEntry(JournalEntry entry, JournalReplayContext context) =>
+        context.GetRequiredCommandCodec(entry.FormatKey, _codec).Apply(entry.Reader, this);
+
+    void IJournaledState.AppendEntries(JournalStreamWriter writer)
+    {
+        // We use a push model, and append entries upon modification.
+    }
+
+    void IJournaledState.AppendSnapshot(JournalStreamWriter snapshotWriter)
+    {
+        if (_nodes.Count == 0)
+        {
+            _codec.WriteSnapshot(0, default!, [], snapshotWriter);
+        }
+        else
+        {
+            _codec.WriteSnapshot(Count, Root, GetEdges(), snapshotWriter);
+        }
+    }
+
+    void IJournaledState.Reset(JournalStreamWriter writer)
+    {
+        ApplyClear();
+        _writer = writer;
+    }
+
+    #endregion
+
+    #region IDurableTreeCommandHandler
+
+    void IDurableTreeCommandHandler<T>.ApplySetRoot(T root) => ApplySetRoot(root);
+    void IDurableTreeCommandHandler<T>.ApplyAdd(T parent, T value) => ApplyAdd(parent, value);
+    void IDurableTreeCommandHandler<T>.ApplyRemove(T value) => ApplyRemove(value);
+    void IDurableTreeCommandHandler<T>.ApplyMove(T value, T parent) => ApplyMove(value, parent);
+    void IDurableTreeCommandHandler<T>.ApplyClear() => ApplyClear();
+    void IDurableTreeCommandHandler<T>.Reset() => ApplyClear();
+
+    #endregion
 
     public void SetRoot(T value)
     {
@@ -261,22 +416,8 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
             throw new ArgumentException("A node with the same value already exists.", nameof(value));
         }
 
+        _codec.WriteSetRoot(value, GetWriter());
         ApplySetRoot(value);
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            var (self, cmd, value) = state;
-
-            using var session = self._sessionPool.GetSession();
-            
-            var writer = Writer.Create(bufferWriter, session);
-            
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-            
-            self._valueCodec.WriteField(ref writer, 0, typeof(T), value);
-            
-            writer.Commit();
-        }, (this, CommandType.SetRoot, value));
     }
 
     public void Add(T parent, T value)
@@ -291,49 +432,21 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
             throw new ArgumentException("A node with the same value already exists.", nameof(value));
         }
 
+        _codec.WriteAdd(parent, value, GetWriter());
         ApplyAdd(parent, value);
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            var (self, cmd, parent, value) = state;
-            
-            using var session = self._sessionPool.GetSession();
-            
-            var writer = Writer.Create(bufferWriter, session);
-            
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-            
-            self._valueCodec.WriteField(ref writer, 0, typeof(T), parent);
-            self._valueCodec.WriteField(ref writer, 1, typeof(T), value);
-            
-            writer.Commit();
-        }, (this, CommandType.Add, parent, value));
     }
 
     public bool Remove(T value)
     {
-        if (ApplyRemove(value))
+        if (!_nodes.ContainsKey(value))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, value) = state;
-
-                using var session = self._sessionPool.GetSession();
-
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-
-                self._valueCodec.WriteField(ref writer, 0, typeof(T), value);
-
-                writer.Commit();
-            }, (this, CommandType.Remove, value));
-
-            return true;
+            return false;
         }
 
-        return false;
+        _codec.WriteRemove(value, GetWriter());
+        ApplyRemove(value);
+
+        return true;
     }
 
     public bool Move(T value, T parent)
@@ -353,47 +466,32 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
             throw new InvalidOperationException("Cannot move the root node.");
         }
 
-        if (ApplyMove(value, parent))
+        if (!_nodes.TryGetValue(value, out var nodeToMoveData) || nodeToMoveData.Parent is null)
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, value, parent) = state;
-                
-                using var session = self._sessionPool.GetSession();
-                
-                var writer = Writer.Create(bufferWriter, session);
-                
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-                
-                self._valueCodec.WriteField(ref writer, 0, typeof(T), value);
-                self._valueCodec.WriteField(ref writer, 1, typeof(T), parent);
-                
-                writer.Commit();
-            }, (this, CommandType.Move, value, parent));
-
-            return true;
+            return false;
         }
 
-        return false;
+        var oldParent = nodeToMoveData.Parent;
+        if (EqualityComparer<T>.Default.Equals(oldParent, parent))
+        {
+            return false;
+        }
+
+        _codec.WriteMove(value, parent, GetWriter());
+        ApplyMove(value, parent);
+
+        return true;
     }
 
     public void Clear()
     {
-        ApplyClear();
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
+        if (_nodes.Count == 0)
         {
-            var (self, cmd) = state;
-            
-            using var session = self._sessionPool.GetSession();
-            
-            var writer = Writer.Create(bufferWriter, session);
-            
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-            
-            writer.Commit();
-        }, (this, CommandType.Clear));
+            return;
+        }
+
+        _codec.WriteClear(GetWriter());
+        ApplyClear();
     }
 
     public bool Contains(T value) => _nodes.ContainsKey(value);
@@ -446,10 +544,10 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
         }
     }
 
-    private void ApplySetRoot(T rootValue)
+    private void ApplySetRoot(T root)
     {
-        _root = rootValue;
-        _nodes[rootValue] = new Node(default);
+        _root = root;
+        _nodes[root] = new Node(default);
     }
 
     private void ApplyAdd(T parentValue, T newValue)
@@ -458,11 +556,11 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
         _nodes[newValue] = new Node(parentValue);
     }
 
-    private bool ApplyRemove(T value)
+    private void ApplyRemove(T value)
     {
         if (!_nodes.TryGetValue(value, out var nodeToRemove))
         {
-            return false;
+            return;
         }
 
         // Remove node from its parent's children list.
@@ -480,7 +578,11 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
         {
             if (_nodes.TryGetValue(current, out var data))
             {
-                foreach (var child in data.Children) queue.Enqueue(child);
+                foreach (var child in data.Children)
+                {
+                    queue.Enqueue(child);
+                }
+
                 _nodes.Remove(current);
             }
         }
@@ -490,21 +592,19 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
         {
             _root = default;
         }
-
-        return true;
     }
 
-    private bool ApplyMove(T valueToMove, T newParentValue)
+    private void ApplyMove(T valueToMove, T newParentValue)
     {
         if (!_nodes.TryGetValue(valueToMove, out var nodeToMoveData) || nodeToMoveData.Parent is null)
         {
-            return false; // Cannot move root or non just an non-existent node.
+            return; // Cannot move root or non just an non-existent node.
         }
 
         var oldParent = nodeToMoveData.Parent;
         if (EqualityComparer<T>.Default.Equals(oldParent, newParentValue))
         {
-            return false; // No change, so skip.
+            return; // No change, so skip.
         }
 
         // Unlink from old parent
@@ -513,8 +613,6 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
         // Link to new parent
         nodeToMoveData.Parent = newParentValue;
         _nodes[newParentValue].Children.Add(valueToMove);
-
-        return true;
     }
 
     private void ApplyClear()
@@ -550,26 +648,37 @@ internal sealed class DurableTree<T> : IDurableTree<T>, IDurableStateMachine whe
         return false;
     }
 
-    private IStateMachineLogWriter GetStorage()
+    private IEnumerable<(T Child, T Parent)> GetEdges()
     {
-        Debug.Assert(_storage is not null);
-        return _storage;
+        // We use BFS (Breadth-First Search) to serialize all other nodes, guaranteeing parent-before-child order.
+        // We need to serialize the tree into a flat, linear stream of bytes. To rebuild it correctly, a parent node
+        // must always be processed before its children. If we process a child first, the ApplySnapshot method will fail
+        // when it tries to link that child to a parent that does not exist yet in the reconstructed tree.
+
+        using var queue = new ValueQueue();
+
+        queue.Enqueue(Root);
+
+        while (queue.TryDequeue(out var current))
+        {
+            var node = _nodes[current];
+
+            foreach (var child in node.Children)
+            {
+                yield return (child, current);
+                queue.Enqueue(child);
+            }
+        }
     }
 
-    public IDurableStateMachine DeepCopy() => throw new NotImplementedException();
+    private JournalStreamWriter GetWriter()
+    {
+        Debug.Assert(_writer.HasValue);
+        return _writer.Value;
+    }
 
-    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     public IEnumerator<T> GetEnumerator() => _nodes.Keys.GetEnumerator();
-
-    private enum CommandType : uint
-    {
-        Clear = 0,
-        Snapshot = 1,
-        Add = 2,
-        Remove = 3,
-        Move = 4,
-        SetRoot = 5,
-    }
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 
     private sealed class Node(T? parent)
     {

@@ -1,5 +1,5 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
-using System.Buffers;
+using Microsoft.Extensions.Options;
 using System.Collections;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -70,32 +70,188 @@ public interface IDurableOrderedSet<T> : IEnumerable<T>, IReadOnlyCollection<T>
 }
 
 /// <summary>
-/// A durable state machine that represents an ordered set.
-/// It maintains insertion order and guarantees uniqueness.
+/// Receives decoded durable ordered set commands from a codec implementation.
 /// </summary>
-[DebuggerDisplay("Count = {Count}")]
-internal sealed class DurableOrderedSet<T> : IDurableOrderedSet<T>, IDurableStateMachine
+public interface IDurableOrderedSetCommandHandler<T>
+{
+    /// <summary>Applies an add command.</summary>
+    void ApplyAdd(T item);
+
+    /// <summary>Applies a remove command.</summary>
+    void ApplyRemove(T item);
+
+    /// <summary>Applies a clear command.</summary>
+    void ApplyClear();
+
+    /// <summary>Resets the receiver before applying replacement entries.</summary>
+    void Reset(int capacityHint);
+}
+
+/// <summary>
+/// Serializes one durable ordered set command and applies one decoded command.
+/// </summary>
+public interface IDurableOrderedSetCommandCodec<T>
+{
+    /// <summary>Writes an add command.</summary>
+    void WriteAdd(T item, JournalStreamWriter writer);
+
+    /// <summary>Writes a remove command.</summary>
+    void WriteRemove(T item, JournalStreamWriter writer);
+
+    /// <summary>Writes a clear command.</summary>
+    void WriteClear(JournalStreamWriter writer);
+
+    /// <summary>Writes a snapshot command, deriving the item count from <paramref name="items"/>.</summary>
+    void WriteSnapshot(IReadOnlyCollection<T> items, JournalStreamWriter writer);
+
+    /// <summary>Reads one encoded command and applies it to <paramref name="handler"/>.</summary>
+    void Apply(JournalBufferReader input, IDurableOrderedSetCommandHandler<T> handler);
+}
+
+internal sealed class DurableOrderedSetCommandBinaryCodec<T>(
+    IFieldCodec<T> codec, SerializerSessionPool sessionPool) : IDurableOrderedSetCommandCodec<T>
 {
     private const byte VersionByte = 0;
 
-    private IStateMachineLogWriter? _storage;
+    private enum CommandType : uint
+    {
+        Clear = 0,
+        Snapshot = 1,
+        Add = 2,
+        Remove = 3
+    }
 
-    private readonly SerializerSessionPool _sessionPool;
-    private readonly IFieldCodec<T> _valueCodec;
+    public void WriteAdd(T item, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
 
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Add);
+
+        codec.WriteField(ref payloadWriter, 0, typeof(T), item);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteRemove(T item, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Remove);
+
+        codec.WriteField(ref payloadWriter, 0, typeof(T), item);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteClear(JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Clear);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteSnapshot(IReadOnlyCollection<T> items, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Snapshot);
+        payloadWriter.WriteVarUInt32((uint)items.Count);
+
+        // We iterate the list to preserve order.
+        foreach (var item in items)
+        {
+            codec.WriteField(ref payloadWriter, 0, typeof(T), item);
+        }
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void Apply(JournalBufferReader input, IDurableOrderedSetCommandHandler<T> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+
+        using var slice = input.Peek(input.Length);
+        using var session = sessionPool.GetSession();
+
+        var reader = Reader.Create(slice, session);
+        var version = reader.ReadByte();
+
+        if (version != VersionByte)
+        {
+            throw new NotSupportedException($"This command codec supports version {(uint)VersionByte} and not version {(uint)version}.");
+        }
+
+        var command = (CommandType)reader.ReadVarUInt32();
+
+        switch (command)
+        {
+            case CommandType.Add: handler.ApplyAdd(ReadValue(ref reader)); break;
+            case CommandType.Remove: handler.ApplyRemove(ReadValue(ref reader)); break;
+            case CommandType.Clear: handler.ApplyClear(); break;
+            case CommandType.Snapshot:
+                {
+                    var count = (int)reader.ReadVarUInt32();
+                    handler.Reset(count);
+                    for (var i = 0; i < count; i++)
+                    {
+                        handler.ApplyAdd(ReadValue(ref reader));
+                    }
+                }
+                break;
+            default: Helpers.ThrowUnsupportedCommand(command); break;
+        }
+
+        Helpers.ThrowIfTrailingData(ref reader);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        T ReadValue<TInput>(ref Reader<TInput> reader)
+        {
+            var field = reader.ReadFieldHeader();
+            return codec.ReadValue(ref reader, field);
+        }
+    }
+}
+
+[DebuggerDisplay("Count = {Count}")]
+internal sealed class DurableOrderedSet<T> :
+    IDurableOrderedSet<T>,
+    IDurableOrderedSetCommandHandler<T>,
+    IJournaledState
+{
+    private JournalStreamWriter? _writer;
     private readonly HashSet<T> _set = [];
     private readonly List<T> _list = [];
+    private readonly IDurableOrderedSetCommandCodec<T> _codec;
 
     public DurableOrderedSet(
-        [ServiceKey] string key, IStateMachineManager manager,
-        IFieldCodec<T> valueCodec, SerializerSessionPool sessionPool)
+        [ServiceKey] string key, IJournaledStateManager manager,
+        IOptions<JournaledStateManagerOptions> options, IServiceProvider serviceProvider)
     {
         ArgumentException.ThrowIfNullOrEmpty(key);
-
-        _valueCodec = valueCodec;
-        _sessionPool = sessionPool;
-
-        manager.RegisterStateMachine(key, this);
+        _codec = Helpers.GetCodec<IDurableOrderedSetCommandCodec<T>>(serviceProvider, options);
+        manager.RegisterState(key, this);
     }
 
     public int Count
@@ -109,178 +265,89 @@ internal sealed class DurableOrderedSet<T> : IDurableOrderedSet<T>, IDurableStat
 
     public ReadOnlySpan<T> OrderedItems => CollectionsMarshal.AsSpan(_list);
 
-    public bool Contains(T item) => _set.Contains(item);
-    public bool TryGetValue(T equalValue, [MaybeNullWhen(false)] out T actualValue) => _set.TryGetValue(equalValue, out actualValue);
-    
+    #region IJournalState
+
+    IJournaledState IJournaledState.DeepCopy() => throw new NotImplementedException();
+
+    void IJournaledState.ReplayEntry(JournalEntry entry, JournalReplayContext context) =>
+        context.GetRequiredCommandCodec(entry.FormatKey, _codec).Apply(entry.Reader, this);
+
+    void IJournaledState.AppendEntries(JournalStreamWriter writer)
+    {
+        // We use a push model, and append entries upon modification.
+    }
+
+    void IJournaledState.AppendSnapshot(JournalStreamWriter snapshotWriter) => _codec.WriteSnapshot(this, snapshotWriter);
+
+    void IJournaledState.Reset(JournalStreamWriter writer)
+    {
+        ApplyClear();
+        _writer = writer;
+    }
+
+    #endregion
+
+    #region IDurableOrderedSetCommandHandler
+
+    void IDurableOrderedSetCommandHandler<T>.ApplyAdd(T item) => ApplyAdd(item);
+    void IDurableOrderedSetCommandHandler<T>.ApplyRemove(T item) => ApplyRemove(item);
+    void IDurableOrderedSetCommandHandler<T>.ApplyClear() => ApplyClear();
+    void IDurableOrderedSetCommandHandler<T>.Reset(int capacityHint)
+    {
+        ApplyClear();
+        _set.EnsureCapacity(capacityHint);
+        _list.Capacity = capacityHint;
+    }
+
+    #endregion
+
     // We use the list's CopyTo in order to preserve the order when the elements are copied to the destination array.
     public void CopyTo(T[] array, int arrayIndex) => _list.CopyTo(array, arrayIndex);
+    public bool Contains(T item) => _set.Contains(item);
+    public bool TryGetValue(T equalValue, [MaybeNullWhen(false)] out T actualValue) => _set.TryGetValue(equalValue, out actualValue);
 
     public bool Add(T item)
     {
-        if (ApplyAdd(item))
+        if (_set.Contains(item))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, itemValue) = state;
-
-                using var session = self._sessionPool.GetSession();
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-
-                self._valueCodec.WriteField(ref writer, 0, typeof(T), itemValue);
-
-                writer.Commit();
-            }, (this, CommandType.Add, item));
-
-            return true;
+            return false;
         }
 
-        return false;
+        _codec.WriteAdd(item, GetWriter());
+        ApplyAdd(item);
+
+        return true;
     }
 
     public bool Remove(T item)
     {
-        if (ApplyRemove(item))
+        if (!_set.Contains(item))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, itemValue) = state;
-
-                using var session = self._sessionPool.GetSession();
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-
-                self._valueCodec.WriteField(ref writer, 0, typeof(T), itemValue);
-
-                writer.Commit();
-            }, (this, CommandType.Remove, item));
-
-            return true;
+            return false;
         }
 
-        return false;
+        _codec.WriteRemove(item, GetWriter());
+        ApplyRemove(item);
+
+        return true;
     }
 
     public void Clear()
     {
+        _codec.WriteClear(GetWriter());
         ApplyClear();
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            var (self, cmd) = state;
-
-            using var session = self._sessionPool.GetSession();
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-
-            writer.Commit();
-        }, (this, CommandType.Clear));
     }
 
-    void IDurableStateMachine.Reset(IStateMachineLogWriter storage)
+    private void ApplyAdd(T item)
     {
-        ApplyClear();
-        _storage = storage;
+        _set.Add(item);
+        _list.Add(item);
     }
 
-    void IDurableStateMachine.Apply(ReadOnlySequence<byte> logEntry)
+    private void ApplyRemove(T item)
     {
-        using var session = _sessionPool.GetSession();
-
-        var reader = Reader.Create(logEntry, session);
-        var version = reader.ReadByte();
-
-        if (version != VersionByte)
-        {
-            throw new NotSupportedException($"This instance of {nameof(DurableOrderedSet<T>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
-        }
-
-        var command = (CommandType)reader.ReadVarUInt32();
-
-        switch (command)
-        {
-            case CommandType.Add: ApplyAdd(ReadValue(ref reader)); break;
-            case CommandType.Remove: ApplyRemove(ReadValue(ref reader)); break;
-            case CommandType.Clear: ApplyClear(); break;
-            case CommandType.Snapshot: ApplySnapshot(ref reader); break;
-            default: throw new NotSupportedException($"Command type {command} is not supported.");
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        T ReadValue(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var field = reader.ReadFieldHeader();
-            return _valueCodec.ReadValue(ref reader, field);
-        }
-
-        void ApplySnapshot(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var count = (int)reader.ReadVarUInt32();
-
-            ApplyClear();
-
-            _set.EnsureCapacity(count);
-            _list.Capacity = count;
-
-            for (var i = 0; i < count; i++)
-            {
-                ApplyAdd(ReadValue(ref reader));
-            }
-        }
-    }
-
-    void IDurableStateMachine.AppendSnapshot(StateMachineStorageWriter writer)
-    {
-        writer.AppendEntry(static (self, bufferWriter) =>
-        {
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)CommandType.Snapshot);
-            writer.WriteVarUInt32((uint)self._list.Count);
-
-            // We iterate the list, not the set, to preserve order.
-            foreach (var item in self._list)
-            {
-                self._valueCodec.WriteField(ref writer, 0, typeof(T), item);
-            }
-
-            writer.Commit();
-        }, this);
-    }
-
-    void IDurableStateMachine.AppendEntries(StateMachineStorageWriter writer)
-    {
-        // We use a push model, and appened entries upon modification.
-    }
-
-    private bool ApplyAdd(T item)
-    {
-        if (_set.Add(item))
-        {
-            _list.Add(item);
-            return true;
-        }
-
-        return false;
-    }
-
-    private bool ApplyRemove(T item)
-    {
-        if (_set.Remove(item))
-        {
-            _list.Remove(item);
-            return true;
-        }
-
-        return false;
+        _set.Remove(item);
+        _list.Remove(item);
     }
 
     private void ApplyClear()
@@ -289,23 +356,13 @@ internal sealed class DurableOrderedSet<T> : IDurableOrderedSet<T>, IDurableStat
         _list.Clear();
     }
 
-    private IStateMachineLogWriter GetStorage()
+    private JournalStreamWriter GetWriter()
     {
-        Debug.Assert(_storage is not null);
-        return _storage;
+        Debug.Assert(_writer.HasValue);
+        return _writer.Value;
     }
 
     // We return the list enumerator since this type is an ordered collection.
     public IEnumerator<T> GetEnumerator() => _list.GetEnumerator();
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-
-    public IDurableStateMachine DeepCopy() => throw new NotImplementedException();
-
-    private enum CommandType : uint
-    {
-        Clear = 0,
-        Snapshot = 1,
-        Add = 2,
-        Remove = 3
-    }
 }

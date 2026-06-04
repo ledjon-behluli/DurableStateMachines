@@ -1,9 +1,9 @@
-﻿using System.Buffers;
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using System.Collections;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
-using Microsoft.Extensions.DependencyInjection;
 
 namespace Ledjon.DurableStateMachines;
 
@@ -68,215 +68,49 @@ public interface IDurableStack<T> : IEnumerable<T>, IReadOnlyCollection<T>
     bool TryPeek([MaybeNullWhen(false)] out T item);
 }
 
-[DebuggerDisplay("Count = {Count}")]
-[DebuggerTypeProxy(typeof(DurableStackDebugView<>))]
-internal sealed class DurableStack<T> : IDurableStack<T>, IDurableStateMachine
+/// <summary>
+/// Receives decoded durable stack commands from a codec implementation.
+/// </summary>
+public interface IDurableStackCommandHandler<T>
+{
+    /// <summary>Applies a push command.</summary>
+    void ApplyPush(T item);
+
+    /// <summary>Applies a pop command.</summary>
+    void ApplyPop();
+
+    /// <summary>Applies a clear command.</summary>
+    void ApplyClear();
+
+    /// <summary>Resets the receiver before applying replacement entries.</summary>
+    void Reset(int capacityHint);
+}
+
+/// <summary>
+/// Serializes one durable stack command and applies one decoded command.
+/// </summary>
+public interface IDurableStackCommandCodec<T>
+{
+    /// <summary>Writes a push command.</summary>
+    void WritePush(T item, JournalStreamWriter writer);
+
+    /// <summary>Writes a pop command.</summary>
+    void WritePop(JournalStreamWriter writer);
+
+    /// <summary>Writes a clear command.</summary>
+    void WriteClear(JournalStreamWriter writer);
+
+    /// <summary>Writes a snapshot command, deriving the item count from <paramref name="items"/>.</summary>
+    void WriteSnapshot(IReadOnlyCollection<T> items, JournalStreamWriter writer);
+
+    /// <summary>Reads one encoded command and applies it to <paramref name="handler"/>.</summary>
+    void Apply(JournalBufferReader input, IDurableStackCommandHandler<T> handler);
+}
+
+internal sealed class DurableStackCommandBinaryCodec<T>(
+    IFieldCodec<T> codec, SerializerSessionPool sessionPool) : IDurableStackCommandCodec<T>
 {
     private const byte VersionByte = 0;
-
-    private IStateMachineLogWriter? _storage;
-
-    private readonly SerializerSessionPool _sessionPool;
-    private readonly IFieldCodec<T> _codec;
-    private readonly Stack<T> _items = new();
-
-    public DurableStack(
-        [ServiceKey] string key, IStateMachineManager manager,
-        IFieldCodec<T> codec, SerializerSessionPool sessionPool)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(key);
-
-        _codec = codec;
-        _sessionPool = sessionPool;
-
-        manager.RegisterStateMachine(key, this);
-    }
-
-    public int Count => _items.Count;
-
-    void IDurableStateMachine.AppendEntries(StateMachineStorageWriter writer)
-    {
-        // We use a push model, and appened entries upon modification.
-    }
-
-    void IDurableStateMachine.Reset(IStateMachineLogWriter storage)
-    {
-        ApplyClear();
-        _storage = storage;
-    }
-
-    void IDurableStateMachine.Apply(ReadOnlySequence<byte> logEntry)
-    {
-        using var session = _sessionPool.GetSession();
-
-        var reader = Reader.Create(logEntry, session);
-        var version = reader.ReadByte();
-
-        if (version != VersionByte)
-        {
-            throw new NotSupportedException($"This instance of {nameof(DurableStack<T>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
-        }
-
-        var command = (CommandType)reader.ReadVarUInt32();
-
-        switch (command)
-        {
-            case CommandType.Clear: ApplyClear(); break;
-            case CommandType.Snapshot: ApplySnapshot(ref reader); break;
-            case CommandType.Push: ApplyPush(ReadValue(ref reader)); break;
-            case CommandType.Pop: _ = ApplyPop(); break;
-            default: throw new NotSupportedException($"Command type {command} is not supported");
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        T ReadValue(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var field = reader.ReadFieldHeader();
-            return _codec.ReadValue(ref reader, field);
-        }
-
-        void ApplySnapshot(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var count = (int)reader.ReadVarUInt32();
-
-            ApplyClear();
-
-            _items.EnsureCapacity(count);
-
-            for (var i = 0; i < count; i++)
-            {
-                ApplyPush(ReadValue(ref reader));
-            }
-        }
-    }
-
-    void IDurableStateMachine.AppendSnapshot(StateMachineStorageWriter snapshotWriter)
-    {
-        snapshotWriter.AppendEntry(static (self, bufferWriter) =>
-        {
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)CommandType.Snapshot);
-            writer.WriteVarUInt32((uint)self._items.Count);
-
-            // Stack enumerates from top-to-bottom, but the restore process pushes items back one-by-one.
-            // To reconstruct the original LIFO order, we must reverse the enumeration
-            // and write the bottom-most item first, ensuring the final restored state is identical.
-
-            foreach (var item in self._items.Reverse())
-            {
-                self._codec.WriteField(ref writer, 0, typeof(T), item);
-            }
-
-            writer.Commit();
-        }, this);
-    }
-
-    public bool Contains(T item) => _items.Contains(item);
-    public void CopyTo(T[] array, int arrayIndex) => _items.CopyTo(array, arrayIndex);
-    public T Peek() => _items.Peek();
-    public bool TryPeek([MaybeNullWhen(false)] out T item) => _items.TryPeek(out item);
-
-    public void Push(T item)
-    {
-        ApplyPush(item);
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            var (self, cmd, item) = state;
-
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-
-            self._codec.WriteField(ref writer, 0, typeof(T), item);
-
-            writer.Commit();
-        }, (this, CommandType.Push, item));
-    }
-
-    public T Pop()
-    {
-        var result = ApplyPop();
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            (var self, var cmd) = state;
-
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-
-            writer.Commit();
-        }, (this, CommandType.Pop));
-
-        return result;
-    }
-
-    public bool TryPop([MaybeNullWhen(false)] out T item)
-    {
-        if (ApplyTryPop(out item))
-        {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                (var self, var cmd) = state;
-
-                using var session = self._sessionPool.GetSession();
-
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-
-                writer.Commit();
-            }, (this, CommandType.Pop));
-
-            return true;
-        }
-
-        return false;
-    }
-
-    public void Clear()
-    {
-        ApplyClear();
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            (var self, var cmd) = state;
-
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-
-            writer.Commit();
-        }, (this, CommandType.Clear));
-    }
-
-    private T ApplyPop() => _items.Pop();
-    private void ApplyPush(T item) => _items.Push(item);
-    private bool ApplyTryPop([MaybeNullWhen(false)] out T item) => _items.TryPop(out item!);
-    private void ApplyClear() => _items.Clear();
-
-    private IStateMachineLogWriter GetStorage()
-    {
-        Debug.Assert(_storage is not null);
-        return _storage;
-    }
-
-    public IDurableStateMachine DeepCopy() => throw new NotImplementedException();
-
-    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-    public IEnumerator<T> GetEnumerator() => _items.GetEnumerator();
 
     private enum CommandType : uint
     {
@@ -285,6 +119,229 @@ internal sealed class DurableStack<T> : IDurableStack<T>, IDurableStateMachine
         Push = 2,
         Pop = 3
     }
+
+    public void WritePush(T item, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Push);
+        
+        codec.WriteField(ref payloadWriter, 0, typeof(T), item);
+
+        payloadWriter.Commit();     
+        entry.Commit();
+    }
+
+    public void WritePop(JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Pop);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteClear(JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Clear);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteSnapshot(IReadOnlyCollection<T> items, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Snapshot);
+        payloadWriter.WriteVarUInt32((uint)items.Count);
+
+        // Stack enumerates from top-to-bottom, but the restore process pushes items back one-by-one.
+        // To reconstruct the original LIFO order, we must reverse the enumeration
+        // and write the bottom-most item first, ensuring the final restored state is identical.
+
+        foreach (var item in items.Reverse())
+        {
+            codec.WriteField(ref payloadWriter, 0, typeof(T), item);
+        }
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void Apply(JournalBufferReader input, IDurableStackCommandHandler<T> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+
+        using var slice = input.Peek(input.Length);
+        using var session = sessionPool.GetSession();
+
+        var reader = Reader.Create(slice, session);
+        var version = reader.ReadByte();
+
+        if (version != VersionByte)
+        {
+            throw new NotSupportedException($"This command codec supports version {(uint)VersionByte} and not version {(uint)version}.");
+        }
+
+        var command = (CommandType)reader.ReadVarUInt32();
+
+        switch (command)
+        {
+            case CommandType.Push: handler.ApplyPush(ReadValue(ref reader)); break;
+            case CommandType.Pop: handler.ApplyPop(); break;
+            case CommandType.Clear: handler.ApplyClear(); break;
+            case CommandType.Snapshot:
+                {
+                    var count = (int)reader.ReadVarUInt32();
+
+                    handler.Reset(count);
+
+                    for (var i = 0; i < count; i++)
+                    {
+                        handler.ApplyPush(ReadValue(ref reader));
+                    }
+                }
+                break;
+            default: Helpers.ThrowUnsupportedCommand(command); break;
+        }
+
+        Helpers.ThrowIfTrailingData(ref reader);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private T ReadValue<TInput>(ref Reader<TInput> reader)
+    {
+        var field = reader.ReadFieldHeader();
+        return codec.ReadValue(ref reader, field);
+    }
+}
+
+[DebuggerDisplay("Count = {Count}")]
+[DebuggerTypeProxy(typeof(DurableStackDebugView<>))]
+internal sealed class DurableStack<T> : 
+    IDurableStack<T>, 
+    IDurableStackCommandHandler<T>, 
+    IJournaledState
+{
+    private JournalStreamWriter? _writer;
+    private readonly Stack<T> _items = new();
+    private readonly IDurableStackCommandCodec<T> _codec;
+
+    public DurableStack(
+        [ServiceKey] string key, IJournaledStateManager manager,
+        IOptions<JournaledStateManagerOptions> options, IServiceProvider serviceProvider)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        _codec = Helpers.GetCodec<IDurableStackCommandCodec<T>>(serviceProvider, options);
+        manager.RegisterState(key, this);
+    }
+
+    public int Count => _items.Count;
+
+    #region IJournalState
+
+    IJournaledState IJournaledState.DeepCopy() => throw new NotImplementedException();
+
+    void IJournaledState.ReplayEntry(JournalEntry entry, JournalReplayContext context) =>
+        context.GetRequiredCommandCodec(entry.FormatKey, _codec).Apply(entry.Reader, this);
+
+    void IJournaledState.AppendEntries(JournalStreamWriter writer)
+    {
+        // We use a push model, and appened entries upon modification.
+    }
+
+    void IJournaledState.AppendSnapshot(JournalStreamWriter snapshotWriter) => _codec.WriteSnapshot(this, snapshotWriter);
+
+    void IJournaledState.Reset(JournalStreamWriter writer)
+    {
+        _items.Clear();
+        _writer = writer;
+    }
+
+    #endregion
+
+    #region IDurableStackCommandHandler
+
+    void IDurableStackCommandHandler<T>.ApplyPush(T item) => _items.Push(item);
+    void IDurableStackCommandHandler<T>.ApplyPop() => _items.Pop();
+    void IDurableStackCommandHandler<T>.ApplyClear() => _items.Clear();
+    void IDurableStackCommandHandler<T>.Reset(int capacityHint)
+    {
+        _items.Clear();
+        _items.EnsureCapacity(capacityHint);
+    }
+
+    #endregion
+
+    public void Push(T item)
+    {
+        _codec.WritePush(item, GetWriter());
+        _items.Push(item);
+    }
+
+    public T Pop()
+    {
+        var result = _items.Peek(); // If the queue is empty, this throws before we touch the journal stream.
+
+        _codec.WritePop(GetWriter());
+        _items.Pop();
+
+        return result;
+    }
+
+    public bool TryPop([MaybeNullWhen(false)] out T item)
+    {
+        if (!_items.TryPeek(out item))
+        {
+            return false;
+        }
+
+        _codec.WritePop(GetWriter());
+        _items.Pop();
+
+        return true;
+    }
+
+    public void Clear()
+    { 
+        _codec.WriteClear(GetWriter());
+        _items.Clear();
+    }
+
+    private JournalStreamWriter GetWriter()
+    {
+        Debug.Assert(_writer.HasValue);
+        return _writer.Value;
+    }
+
+    public bool Contains(T item) => _items.Contains(item);
+    public void CopyTo(T[] array, int arrayIndex) => _items.CopyTo(array, arrayIndex);
+    public T Peek() => _items.Peek();
+    public bool TryPeek([MaybeNullWhen(false)] out T item) => _items.TryPeek(out item);
+
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    public IEnumerator<T> GetEnumerator() => _items.GetEnumerator();
+
 }
 
 internal sealed class DurableStackDebugView<T>(DurableStack<T> stack)

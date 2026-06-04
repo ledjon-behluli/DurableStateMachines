@@ -1,6 +1,5 @@
-﻿using System.Buffers;
-using System.Diagnostics;
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 namespace Ledjon.DurableStateMachines;
 
@@ -88,21 +87,103 @@ public interface IDurableCancellationTokenSource
     void CancelAfter(TimeSpan delay);
 }
 
-[DebuggerDisplay("Pending = {IsCancellationPending}, Requested = {Token.IsCancellationRequested}, Scheduled = {_scheduledCancellation.IsScheduled}")]
-internal sealed class DurableCancellationTokenSource : IDurableCancellationTokenSource, IDurableStateMachine, IDisposable
+/// <summary>
+/// Receives decoded durable cancellation token source commands from a codec implementation.
+/// </summary>
+public interface IDurableCancellationTokenSourceCommandHandler
+{
+    /// <summary>Applies a state command.</summary>
+    void ApplyState(bool isCanceled, bool isScheduled, long requestTicks, long delayTicks);
+
+    /// <summary>Resets the receiver before applying replacement entries.</summary>
+    void Reset();
+}
+
+/// <summary>
+/// Serializes one durable cancellation token source command and applies one decoded command.
+/// </summary>
+public interface IDurableCancellationTokenSourceCommandCodec
+{
+    /// <summary>Writes a state command.</summary>
+    void WriteState(bool isCanceled, bool isScheduled, long requestTicks, long delayTicks, JournalStreamWriter writer);
+
+    /// <summary>Reads one encoded command and applies it to <paramref name="handler"/>.</summary>
+    void Apply(JournalBufferReader input, IDurableCancellationTokenSourceCommandHandler handler);
+}
+
+internal sealed class DurableCancellationTokenSourceCommandBinaryCodec(
+    SerializerSessionPool sessionPool) : IDurableCancellationTokenSourceCommandCodec
 {
     private const byte VersionByte = 0;
 
+    public void WriteState(bool isCanceled, bool isScheduled, long requestTicks, long delayTicks, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteByte((byte)(isCanceled ? 1 : 0));
+        payloadWriter.WriteByte((byte)(isScheduled ? 1 : 0));
+
+        if (isScheduled)
+        {
+            payloadWriter.WriteInt64(requestTicks);
+            payloadWriter.WriteInt64(delayTicks);
+        }
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void Apply(JournalBufferReader input, IDurableCancellationTokenSourceCommandHandler handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+
+        using var slice = input.Peek(input.Length);
+        using var session = sessionPool.GetSession();
+        var reader = Reader.Create(slice, session);
+
+        var version = reader.ReadByte();
+        if (version != VersionByte)
+        {
+            throw new NotSupportedException($"This command codec supports version {(uint)VersionByte} and not version {(uint)version}.");
+        }
+
+        var isCanceled = reader.ReadByte() == 1;
+        var isScheduled = reader.ReadByte() == 1;
+
+        long requestTicks = -1;
+        long delayTicks = -1;
+
+        if (isScheduled)
+        {
+            requestTicks = reader.ReadInt64();
+            delayTicks = reader.ReadInt64();
+        }
+
+        handler.ApplyState(isCanceled, isScheduled, requestTicks, delayTicks);
+
+        Helpers.ThrowIfTrailingData(ref reader);
+    }
+}
+
+internal sealed class DurableCancellationTokenSource :
+    IDurableCancellationTokenSource,
+    IDurableCancellationTokenSourceCommandHandler,
+    IJournaledState,
+    IDisposable
+{
     private bool _isCanceled;
     private ScheduledCancellation _scheduledCancellation;
-
-    private CancellationTokenRegistration _ctsr;
     private CancellationTokenSource _cts;
+    private CancellationTokenRegistration _ctsr;
 
     private readonly ReaderWriterLockSlim _lock = new();
     private readonly TimeProvider _timeProvider;
-    private readonly SerializerSessionPool _sessionPool;
-    private readonly IStateMachineManager _manager;
+    private readonly IJournaledStateManager _manager;
+    private readonly IDurableCancellationTokenSourceCommandCodec _codec;
 
     private struct ScheduledCancellation
     {
@@ -130,19 +211,20 @@ internal sealed class DurableCancellationTokenSource : IDurableCancellationToken
     }
 
     public DurableCancellationTokenSource(
-        [ServiceKey] string key, IStateMachineManager manager,
-        TimeProvider timeProvider, SerializerSessionPool sessionPool)
+        [ServiceKey] string key, IJournaledStateManager manager,
+        IOptions<JournaledStateManagerOptions> options,
+        TimeProvider timeProvider, IServiceProvider serviceProvider)
     {
         ArgumentException.ThrowIfNullOrEmpty(key);
 
         _timeProvider = timeProvider;
-        _sessionPool = sessionPool;
         _manager = manager;
-
+        _codec = Helpers.GetCodec<IDurableCancellationTokenSourceCommandCodec>(serviceProvider, options);
         _cts = new(Timeout.InfiniteTimeSpan, _timeProvider);
         _ctsr = ObserveCancellation();
         _scheduledCancellation.Reset();
-        _manager.RegisterStateMachine(key, this);
+
+        manager.RegisterState(key, this);
     }
 
     public CancellationToken Token => _cts.Token;
@@ -177,6 +259,105 @@ internal sealed class DurableCancellationTokenSource : IDurableCancellationToken
             }
         }
     }
+
+    #region IJournalState
+
+    IJournaledState IJournaledState.DeepCopy() => throw new NotImplementedException();
+
+    void IJournaledState.ReplayEntry(JournalEntry entry, JournalReplayContext context) =>
+        context.GetRequiredCommandCodec(entry.FormatKey, _codec).Apply(entry.Reader, this);
+
+    void IJournaledState.AppendEntries(JournalStreamWriter writer)
+    {
+        if (_isCanceled || _scheduledCancellation.IsScheduled)
+        {
+            // We apply the write operation only if we did *change* our default state i.e:
+            // non-canceled & no cancellation scheduled, making this slightly more space efficient.
+
+            _codec.WriteState(_isCanceled, _scheduledCancellation.IsScheduled, _scheduledCancellation.RequestTicks, _scheduledCancellation.DelayTicks, writer);
+        }
+    }
+
+    void IJournaledState.AppendSnapshot(JournalStreamWriter snapshotWriter)
+    {
+        _codec.WriteState(_isCanceled, _scheduledCancellation.IsScheduled, _scheduledCancellation.RequestTicks, _scheduledCancellation.DelayTicks, snapshotWriter);
+    }
+
+    void IJournaledState.Reset(JournalStreamWriter writer)
+    {
+        if (_cts.IsCancellationRequested)
+        {
+            _ctsr.Dispose();
+            _cts.Dispose();
+
+            // It is best we crate a new CTS upon reseting, because we publicly expose cts.Token, and we cannot "un-cancel" its source
+            // without violating the contract with consumers who may have registered callbacks, or have passed the token to other operations.
+
+            _cts = new(Timeout.InfiniteTimeSpan, _timeProvider);
+            _ctsr = ObserveCancellation();
+        }
+
+        _isCanceled = false;
+        _scheduledCancellation.Reset();
+    }
+
+    void IJournaledState.OnWriteCompleted()
+    {
+        if (IsCancellationPending)
+        {
+            _cts.Cancel();
+        }
+    }
+
+    void IJournaledState.OnRecoveryCompleted()
+    {
+        if (IsCancellationPending)
+        {
+            _cts.Cancel();
+            return;
+        }
+
+        if (_scheduledCancellation.IsScheduled)
+        {
+            var timeElapsedTicks = _timeProvider.GetUtcNow().UtcTicks - _scheduledCancellation.RequestTicks;
+            var remainingTicks = _scheduledCancellation.DelayTicks - timeElapsedTicks;
+
+            if (remainingTicks <= 0)
+            {
+                _cts.Cancel(); // The scheduled time has passed while deactivated. Trigger cancellation now.
+            }
+            else
+            {
+                _cts.CancelAfter(TimeSpan.FromTicks(remainingTicks)); // The scheduled time is still in the future. Re-arm the in-memory timer.
+            }
+        }
+    }
+
+    #endregion
+
+    #region IDurableCancellationTokenSourceCommandHandler
+
+    void IDurableCancellationTokenSourceCommandHandler.ApplyState(bool isCanceled, bool isScheduled, long requestTicks, long delayTicks)
+    {
+        _isCanceled = isCanceled;
+        if (isScheduled)
+        {
+            _scheduledCancellation.RequestTicks = requestTicks;
+            _scheduledCancellation.DelayTicks = delayTicks;
+        }
+        else
+        {
+            _scheduledCancellation.Reset();
+        }
+    }
+
+    void IDurableCancellationTokenSourceCommandHandler.Reset()
+    {
+        _isCanceled = false;
+        _scheduledCancellation.Reset();
+    }
+
+    #endregion
 
     public void Cancel()
     {
@@ -251,8 +432,6 @@ internal sealed class DurableCancellationTokenSource : IDurableCancellationToken
             var self = (DurableCancellationTokenSource)state!;
             var rwLock = self._lock;
 
-            // We backup the state fields in case the write fails.
-
             bool isCanceled;
             ScheduledCancellation scheduled;
 
@@ -298,122 +477,4 @@ internal sealed class DurableCancellationTokenSource : IDurableCancellationToken
                 }
             }
         }, this);
-
-    void IDurableStateMachine.OnWriteCompleted()
-    {
-        if (IsCancellationPending)
-        {
-            _cts.Cancel();
-        }
-    }
-
-    void IDurableStateMachine.OnRecoveryCompleted()
-    {
-        if (IsCancellationPending)
-        {
-            _cts.Cancel();
-            return;
-        }
-
-        if (_scheduledCancellation.IsScheduled)
-        {
-            var timeElapsedTicks = _timeProvider.GetUtcNow().UtcTicks - _scheduledCancellation.RequestTicks;
-            var remainingTicks = _scheduledCancellation.DelayTicks - timeElapsedTicks;
-
-            if (remainingTicks <= 0)
-            {
-                _cts.Cancel(); // The scheduled time has passed while deactivated. Trigger cancellation now.
-            }
-            else
-            {
-                _cts.CancelAfter(TimeSpan.FromTicks(remainingTicks)); // The scheduled time is still in the future. Re-arm the in-memory timer.
-            }
-        }
-    }
-
-    void IDurableStateMachine.Reset(IStateMachineLogWriter storage)
-    {
-        if (_cts.IsCancellationRequested)
-        {
-            _ctsr.Dispose();
-            _cts.Dispose();
-
-            // It is best we crate a new CTS upon reseting, because we publicly expose cts.Token, and we cannot "un-cancel" its source
-            // without violating the contract with consumers who may have registered callbacks, or have passed the token to other operations.
-
-            _cts = new(Timeout.InfiniteTimeSpan, _timeProvider);
-            _ctsr = ObserveCancellation();
-        }
-
-        _isCanceled = false;
-        _scheduledCancellation.Reset();
-    }
-
-    void IDurableStateMachine.Apply(ReadOnlySequence<byte> logEntry)
-    {
-        using var session = _sessionPool.GetSession();
-
-        var reader = Reader.Create(logEntry, session);
-        var version = reader.ReadByte();
-
-        if (version != VersionByte)
-        {
-            throw new NotSupportedException($"This instance of {nameof(DurableCancellationTokenSource)} supports version {VersionByte} and not version {version}.");
-        }
-
-        _isCanceled = reader.ReadByte() == 1;
-        var isScheduled = reader.ReadByte() == 1;
-
-        if (isScheduled)
-        {
-            _scheduledCancellation.RequestTicks = reader.ReadInt64();
-            _scheduledCancellation.DelayTicks = reader.ReadInt64();
-        }
-        else
-        {
-            _scheduledCancellation.Reset();
-        }
-    }
-
-    void IDurableStateMachine.AppendEntries(StateMachineStorageWriter writer)
-    {
-        if (_isCanceled || _scheduledCancellation.IsScheduled)
-        {
-            // We apply the write operation only if we did *change* our default state i.e:
-            // non-canceled & no cancellation scheduled, making this slightly more space efficient.
-
-            ApplyWrite(writer);
-        }
-    }
-
-    void IDurableStateMachine.AppendSnapshot(StateMachineStorageWriter writer)
-    {
-        ApplyWrite(writer);
-    }
-
-    private void ApplyWrite(StateMachineStorageWriter writer)
-    {
-        writer.AppendEntry(static (self, bufferWriter) =>
-        {
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteByte((byte)(self._isCanceled ? 1 : 0));
-
-            var isScheduled = self._scheduledCancellation.IsScheduled;
-            writer.WriteByte((byte)(isScheduled ? 1 : 0));
-
-            if (isScheduled)
-            {
-                writer.WriteInt64(self._scheduledCancellation.RequestTicks);
-                writer.WriteInt64(self._scheduledCancellation.DelayTicks);
-            }
-
-            writer.Commit();
-        }, this);
-    }
-
-    public IDurableStateMachine DeepCopy() => throw new NotImplementedException();
 }

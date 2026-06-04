@@ -1,5 +1,4 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Ledjon.DurableStateMachines;
@@ -18,15 +17,10 @@ var host = Host.CreateDefaultBuilder(args)
     .UseOrleans(builder =>
     {
         builder.UseLocalhostClustering();
-        builder.AddStateMachineStorage();
-        builder.Services.AddSingleton<IStateMachineStorageProvider>(_ => new VolatileStateMachineStorageProvider());
+        builder.AddJournalStorage();
+        builder.Services.Configure<JournaledStateManagerOptions>(options => options.JournalFormatKey = "orleans-binary");
+        builder.Services.AddSingleton<IJournalStorageProvider, VolatileJournalStorageProvider>();
         builder.Services.AddDurableStateMachines();
-
-        // NOTE: The 'IDurableTaskCompletionSource' found in Orleans has a bug where it can lead to
-        // 'Insufficient data present in buffer' exception. This is a fixed version of it until
-        // this PR is merged and a new version is released. See: https://github.com/dotnet/orleans/pull/9626
-        builder.Services.TryAddKeyedScoped(typeof(IDurableTaskCompletionSourceFixed<>), KeyedService.AnyKey, typeof(DurableTaskCompletionSourceFixed<>));
-
     })
     .Build();
 
@@ -34,10 +28,6 @@ await host.StartAsync();
 
 var logger = host.Services.GetRequiredService<ILogger<Program>>();
 var grainFactory = host.Services.GetRequiredService<IGrainFactory>();
-
-// NOTE: It may happen that you get an error 'Collection was modified; enumeration operation may not execute.'
-// while running these scenarios, there is a bug in the journaling framework.
-// See: https://github.com/dotnet/orleans/pull/9624
 
 logger.LogInformation("\n--- SCENARIO 1: SUCCESSFUL JOB RUN ---\n");
 await RunJob(new JobParameters("job1", TimeSpan.FromSeconds(20), ShouldFail: false));
@@ -87,15 +77,15 @@ async Task RunJob(JobParameters parameters, TimeSpan? cancelAfter = null)
         logger.LogInformation("Polling... Job {JobId} is in step '{Step}' with status '{Status}'",
             parameters.JobId, status.CurrentStep, status.FinalState.Status);
 
-        if (status.FinalState.Status != DurableTaskCompletionSourceStatusFixed.Pending)
+        if (status.FinalState.Status != DurableTaskCompletionSourceStatus.Pending)
         {
             logger.LogInformation("--> Job {JobId} finished with status: {Status}", parameters.JobId, status.FinalState.Status);
 
-            if (status.FinalState.Status == DurableTaskCompletionSourceStatusFixed.Completed)
+            if (status.FinalState.Status == DurableTaskCompletionSourceStatus.Completed)
             {
                 logger.LogInformation("--> Result: {Result}", status.FinalState.Status);
             }
-            else if (status.FinalState.Status == DurableTaskCompletionSourceStatusFixed.Faulted)
+            else if (status.FinalState.Status == DurableTaskCompletionSourceStatus.Faulted)
             {
                 logger.LogError("--> Exception: {ExceptionMessage}", status.FinalState.Exception?.Message);
             }
@@ -132,7 +122,7 @@ async Task RunResilientJob()
     var status = await grain.GetStatus();
     logger.LogInformation("Polling... Job {JobId} has final status '{Status}'", parameters.JobId, status.FinalState.Status);
 
-    if (status.FinalState.Status == DurableTaskCompletionSourceStatusFixed.Canceled)
+    if (status.FinalState.Status == DurableTaskCompletionSourceStatus.Canceled)
     {
         logger.LogInformation("--> SUCCESS: The reactivated grain correctly recognized its canceled state.");
     }

@@ -14,7 +14,7 @@ public class JobGrain(
     ILogger<JobGrain> logger,
     [FromKeyedServices("currentStep")] IDurableValue<ProcessingStep> currentStep,
     [FromKeyedServices("cancelStatus")] IDurableCancellationTokenSource cancelStatus,
-    [FromKeyedServices("finalResult")] IDurableTaskCompletionSourceFixed<string> finalResult)
+    [FromKeyedServices("finalResult")] IDurableTaskCompletionSource<string> finalResult)
         : DurableGrain, IJobGrain
 {
     public async Task Start(JobParameters parameters)
@@ -25,7 +25,7 @@ public class JobGrain(
             return;
         }
 
-        if (finalResult.State.Status is DurableTaskCompletionSourceStatusFixed.Pending &&
+        if (finalResult.State.Status is DurableTaskCompletionSourceStatus.Pending &&
             currentStep.Value > ProcessingStep.NotStarted)
         {
             logger.LogInformation("Resuming job at step '{CurrentStep}'.", currentStep.Value);
@@ -129,7 +129,7 @@ public class JobGrain(
 public record JobParameters(string JobId, TimeSpan OverallTimeout, bool ShouldFail);
 
 [GenerateSerializer]
-public record JobStatus(ProcessingStep CurrentStep, DurableTaskCompletionSourceStateFixed<string> FinalState);
+public record JobStatus(ProcessingStep CurrentStep, DurableTaskCompletionSourceState<string> FinalState);
 
 [GenerateSerializer]
 public enum ProcessingStep { NotStarted, FetchingData, ProcessingData, SavingResults, Finished }

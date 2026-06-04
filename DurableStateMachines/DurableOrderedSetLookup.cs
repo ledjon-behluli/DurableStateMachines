@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using System.Buffers;
 using System.Collections;
 using System.Collections.Immutable;
@@ -78,36 +79,239 @@ public interface IDurableOrderedSetLookup<TKey, TValue> :
     void Clear();
 }
 
-[DebuggerDisplay("Count = {Count}")]
-[DebuggerTypeProxy(typeof(DurableOrderedSetLookupDebugView<,>))]
-internal sealed class DurableOrderedSetLookup<TKey, TValue> : IDurableOrderedSetLookup<TKey, TValue>, IDurableStateMachine
-    where TKey : notnull
+/// <summary>
+/// Receives decoded durable ordered set lookup commands from a codec implementation.
+/// </summary>
+public interface IDurableOrderedSetLookupCommandHandler<TKey, TValue>
+{
+    /// <summary>Applies an add command.</summary>
+    void ApplyAdd(TKey key, TValue value);
+
+    /// <summary>Applies a remove key command.</summary>
+    void ApplyRemoveKey(TKey key);
+
+    /// <summary>Applies a remove item command.</summary>
+    void ApplyRemoveItem(TKey key, TValue value);
+
+    /// <summary>Applies a clear command.</summary>
+    void ApplyClear();
+
+    /// <summary>Resets the receiver before applying replacement entries.</summary>
+    void Reset(int capacityHint);
+}
+
+/// <summary>
+/// Serializes one durable ordered set lookup command and applies one decoded command.
+/// </summary>
+public interface IDurableOrderedSetLookupCommandCodec<TKey, TValue>
+{
+    /// <summary>Writes an add command.</summary>
+    void WriteAdd(TKey key, TValue value, JournalStreamWriter writer);
+
+    /// <summary>Writes a remove key command.</summary>
+    void WriteRemoveKey(TKey key, JournalStreamWriter writer);
+
+    /// <summary>Writes a remove item command.</summary>
+    void WriteRemoveItem(TKey key, TValue value, JournalStreamWriter writer);
+
+    /// <summary>Writes a clear command.</summary>
+    void WriteClear(JournalStreamWriter writer);
+
+    /// <summary>Writes a snapshot command, deriving the item count from <paramref name="items"/>.</summary>
+    void WriteSnapshot(IReadOnlyCollection<(TKey, IReadOnlyCollection<TValue>)> items, JournalStreamWriter writer);
+
+    /// <summary>Reads one encoded command and applies it to <paramref name="handler"/>.</summary>
+    void Apply(JournalBufferReader input, IDurableOrderedSetLookupCommandHandler<TKey, TValue> handler);
+}
+
+internal sealed class DurableOrderedSetLookupCommandBinaryCodec<TKey, TValue>(
+    IFieldCodec<TKey> keyCodec, IFieldCodec<TValue> valueCodec, SerializerSessionPool sessionPool)
+        : IDurableOrderedSetLookupCommandCodec<TKey, TValue>
 {
     private const byte VersionByte = 0;
 
-    private IStateMachineLogWriter? _storage;
+    private enum CommandType : uint
+    {
+        Clear = 0,
+        Snapshot = 1,
+        Add = 2,
+        RemoveKey = 3,
+        RemoveItem = 4
+    }
 
-    private readonly SerializerSessionPool _sessionPool;
-    private readonly IFieldCodec<TKey> _keyCodec;
-    private readonly IFieldCodec<TValue> _valueCodec;
+    public void WriteAdd(TKey key, TValue value, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Add);
+
+        keyCodec.WriteField(ref payloadWriter, 0, typeof(TKey), key);
+        valueCodec.WriteField(ref payloadWriter, 1, typeof(TValue), value);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteRemoveKey(TKey key, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.RemoveKey);
+
+        keyCodec.WriteField(ref payloadWriter, 0, typeof(TKey), key);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteRemoveItem(TKey key, TValue value, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.RemoveItem);
+
+        keyCodec.WriteField(ref payloadWriter, 0, typeof(TKey), key);
+        valueCodec.WriteField(ref payloadWriter, 1, typeof(TValue), value);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteClear(JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Clear);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteSnapshot(IReadOnlyCollection<(TKey, IReadOnlyCollection<TValue>)> items, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Snapshot);
+        payloadWriter.WriteVarUInt32((uint)items.Count);
+
+        foreach (var (key, set) in items)
+        {
+            keyCodec.WriteField(ref payloadWriter, 0, typeof(TKey), key);
+            payloadWriter.WriteVarUInt32((uint)set.Count);
+
+            foreach (var value in set)
+            {
+                valueCodec.WriteField(ref payloadWriter, 1, typeof(TValue), value);
+            }
+        }
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void Apply(JournalBufferReader input, IDurableOrderedSetLookupCommandHandler<TKey, TValue> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+
+        using var slice = input.Peek(input.Length);
+        using var session = sessionPool.GetSession();
+
+        var reader = Reader.Create(slice, session);
+        var version = reader.ReadByte();
+
+        if (version != VersionByte)
+        {
+            throw new NotSupportedException($"This command codec supports version {(uint)VersionByte} and not version {(uint)version}.");
+        }
+
+        var command = (CommandType)reader.ReadVarUInt32();
+
+        switch (command)
+        {
+            case CommandType.Add: handler.ApplyAdd(ReadKey(ref reader), ReadValue(ref reader)); break;
+            case CommandType.RemoveKey: handler.ApplyRemoveKey(ReadKey(ref reader)); break;
+            case CommandType.RemoveItem: handler.ApplyRemoveItem(ReadKey(ref reader), ReadValue(ref reader)); break;
+            case CommandType.Clear: handler.ApplyClear(); break;
+            case CommandType.Snapshot:
+                {
+                    var keyCount = (int)reader.ReadVarUInt32();
+                    handler.Reset(keyCount);
+
+                    for (var i = 0; i < keyCount; i++)
+                    {
+                        var key = ReadKey(ref reader);
+                        var valueCount = (int)reader.ReadVarUInt32();
+
+                        for (var j = 0; j < valueCount; j++)
+                        {
+                            handler.ApplyAdd(key, ReadValue(ref reader));
+                        }
+                    }
+                }
+                break;
+            default: Helpers.ThrowUnsupportedCommand(command); break;
+        }
+
+        Helpers.ThrowIfTrailingData(ref reader);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        TKey ReadKey<TInput>(ref Reader<TInput> reader)
+        {
+            var field = reader.ReadFieldHeader();
+            return keyCodec.ReadValue(ref reader, field);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        TValue ReadValue<TInput>(ref Reader<TInput> reader)
+        {
+            var field = reader.ReadFieldHeader();
+            return valueCodec.ReadValue(ref reader, field);
+        }
+    }
+}
+
+internal sealed class DurableOrderedSetLookup<TKey, TValue> :
+    IDurableOrderedSetLookup<TKey, TValue>,
+    IDurableOrderedSetLookupCommandHandler<TKey, TValue>,
+    IJournaledState
+        where TKey : notnull
+{
+    private JournalStreamWriter? _writer;
     private readonly Dictionary<TKey, OrderedValueSet> _items = [];
+    private readonly IDurableOrderedSetLookupCommandCodec<TKey, TValue> _codec;
 
     public DurableOrderedSetLookup(
-        [ServiceKey] string key, IStateMachineManager manager,
-        IFieldCodec<TKey> keyCodec, IFieldCodec<TValue> valueCodec,
-        SerializerSessionPool sessionPool)
+        [ServiceKey] string key, IJournaledStateManager manager,
+        IOptions<JournaledStateManagerOptions> options, IServiceProvider serviceProvider)
     {
         ArgumentException.ThrowIfNullOrEmpty(key);
-
-        _keyCodec = keyCodec;
-        _valueCodec = valueCodec;
-        _sessionPool = sessionPool;
-
-        manager.RegisterStateMachine(key, this);
+        _codec = Helpers.GetCodec<IDurableOrderedSetLookupCommandCodec<TKey, TValue>>(serviceProvider, options);
+        manager.RegisterState(key, this);
     }
 
     public int Count => _items.Count;
     public IReadOnlyCollection<TKey> Keys => _items.Keys;
+
     public IReadOnlyCollection<TValue> this[TKey key]
     {
         get
@@ -126,100 +330,41 @@ internal sealed class DurableOrderedSetLookup<TKey, TValue> : IDurableOrderedSet
         }
     }
 
-    void IDurableStateMachine.AppendEntries(StateMachineStorageWriter writer)
+    #region IJournalState
+
+    IJournaledState IJournaledState.DeepCopy() => throw new NotImplementedException();
+
+    void IJournaledState.ReplayEntry(JournalEntry entry, JournalReplayContext context) =>
+        context.GetRequiredCommandCodec(entry.FormatKey, _codec).Apply(entry.Reader, this);
+
+    void IJournaledState.AppendEntries(JournalStreamWriter writer)
     {
-        // We use a push model, and appened entries upon modification.
+        // We use a push model, and append entries upon modification.
     }
 
-    void IDurableStateMachine.Reset(IStateMachineLogWriter storage)
+    void IJournaledState.AppendSnapshot(JournalStreamWriter snapshotWriter) => _codec.WriteSnapshot(this, snapshotWriter);
+
+    void IJournaledState.Reset(JournalStreamWriter writer)
     {
         ApplyClear();
-        _storage = storage;
+        _writer = writer;
     }
 
-    void IDurableStateMachine.Apply(ReadOnlySequence<byte> logEntry)
+    #endregion
+
+    #region IDurableOrderedSetLookupCommandHandler
+
+    void IDurableOrderedSetLookupCommandHandler<TKey, TValue>.ApplyAdd(TKey key, TValue value) => ApplyAdd(key, value);
+    void IDurableOrderedSetLookupCommandHandler<TKey, TValue>.ApplyRemoveKey(TKey key) => ApplyRemoveKey(key);
+    void IDurableOrderedSetLookupCommandHandler<TKey, TValue>.ApplyRemoveItem(TKey key, TValue value) => ApplyRemoveItem(key, value);
+    void IDurableOrderedSetLookupCommandHandler<TKey, TValue>.ApplyClear() => ApplyClear();
+    void IDurableOrderedSetLookupCommandHandler<TKey, TValue>.Reset(int capacityHint)
     {
-        using var session = _sessionPool.GetSession();
-
-        var reader = Reader.Create(logEntry, session);
-        var version = reader.ReadByte();
-
-        if (version != VersionByte)
-        {
-            throw new NotSupportedException($"This instance of {nameof(DurableOrderedSetLookup<TKey, TValue>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
-        }
-
-        var command = (CommandType)reader.ReadVarUInt32();
-
-        switch (command)
-        {
-            case CommandType.Add: _ = ApplyAdd(ReadKey(ref reader), ReadValue(ref reader)); break;
-            case CommandType.RemoveKey: _ = ApplyRemoveKey(ReadKey(ref reader)); break;
-            case CommandType.RemoveItem: _ = ApplyRemoveItem(ReadKey(ref reader), ReadValue(ref reader)); break;
-            case CommandType.Clear: ApplyClear(); break;
-            case CommandType.Snapshot: ApplySnapshot(ref reader); break;
-            default: throw new NotSupportedException($"Command type {command} is not supported");
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        TKey ReadKey(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var field = reader.ReadFieldHeader();
-            return _keyCodec.ReadValue(ref reader, field);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        TValue ReadValue(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var field = reader.ReadFieldHeader();
-            return _valueCodec.ReadValue(ref reader, field);
-        }
-
-        void ApplySnapshot(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var keyCount = (int)reader.ReadVarUInt32();
-            ApplyClear();
-
-            _items.EnsureCapacity(keyCount);
-
-            for (var i = 0; i < keyCount; i++)
-            {
-                var key = ReadKey(ref reader);
-                var valueCount = (int)reader.ReadVarUInt32();
-            
-                for (var j = 0; j < valueCount; j++)
-                {
-                    _ = ApplyAdd(key, ReadValue(ref reader));
-                }
-            }
-        }
+        ApplyClear();
+        _items.EnsureCapacity(capacityHint);
     }
 
-    void IDurableStateMachine.AppendSnapshot(StateMachineStorageWriter writer)
-    {
-        writer.AppendEntry(static (self, bufferWriter) =>
-        {
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)CommandType.Snapshot);
-            writer.WriteVarUInt32((uint)self._items.Count);
-
-            foreach (var (key, set) in self._items)
-            {
-                self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
-                writer.WriteVarUInt32((uint)set.Count);
-
-                foreach (var value in set)
-                {
-                    self._valueCodec.WriteField(ref writer, 1, typeof(TValue), value);
-                }
-            }
-            writer.Commit();
-        }, this);
-    }
+    #endregion
 
     public bool Contains(TKey key) => _items.ContainsKey(key);
 
@@ -227,124 +372,72 @@ internal sealed class DurableOrderedSetLookup<TKey, TValue> : IDurableOrderedSet
 
     public bool Add(TKey key, TValue value)
     {
-        if (ApplyAdd(key, value))
+        if (Contains(key, value))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, key, value) = state;
-
-                using var session = self._sessionPool.GetSession();
-                
-                var writer = Writer.Create(bufferWriter, session);
-                
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-                
-                self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
-                self._valueCodec.WriteField(ref writer, 1, typeof(TValue), value);
-                
-                writer.Commit();
-            }, (this, CommandType.Add, key, value));
-
-            return true;
+            return false;
         }
-        return false;
+
+        _codec.WriteAdd(key, value, GetWriter());
+        ApplyAdd(key, value);
+
+        return true;
     }
 
     public bool Remove(TKey key)
     {
-        if (ApplyRemoveKey(key))
+        if (!Contains(key))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, key) = state;
-                
-                using var session = self._sessionPool.GetSession();
-                
-                var writer = Writer.Create(bufferWriter, session);
-                
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-                
-                self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
-                
-                writer.Commit();
-            }, (this, CommandType.RemoveKey, key));
-
-            return true;
+            return false;
         }
-        return false;
+
+        _codec.WriteRemoveKey(key, GetWriter());
+        ApplyRemoveKey(key);
+
+        return true;
     }
 
     public bool Remove(TKey key, TValue value)
     {
-        if (ApplyRemoveItem(key, value))
+        if (!Contains(key, value))
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, cmd, key, value) = state;
-                
-                using var session = self._sessionPool.GetSession();
-                
-                var writer = Writer.Create(bufferWriter, session);
-                
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)cmd);
-                
-                self._keyCodec.WriteField(ref writer, 0, typeof(TKey), key);
-                self._valueCodec.WriteField(ref writer, 1, typeof(TValue), value);
-                
-                writer.Commit();
-            }, (this, CommandType.RemoveItem, key, value));
-
-            return true;
+            return false;
         }
-        return false;
+
+        _codec.WriteRemoveItem(key, value, GetWriter());
+        ApplyRemoveItem(key, value);
+
+        return true;
     }
 
     public void Clear()
     {
+        _codec.WriteClear(GetWriter());
         ApplyClear();
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            var (self, cmd) = state;
-            
-            using var session = self._sessionPool.GetSession();
-            
-            var writer = Writer.Create(bufferWriter, session);
-            
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)cmd);
-            
-            writer.Commit();
-        }, (this, CommandType.Clear));
     }
 
-    private bool ApplyAdd(TKey key, TValue value)
+    private void ApplyAdd(TKey key, TValue value)
     {
         _items.TryGetValue(key, out var set);
 
         var updated = set.Add(value);
-        if (updated.Equals(set))
+        
+        if (!updated.Equals(set))
         {
-            return false;
+            _items[key] = updated;
         }
-
-        _items[key] = updated;
-        return true;
     }
 
-    private bool ApplyRemoveItem(TKey key, TValue value)
+    private void ApplyRemoveItem(TKey key, TValue value)
     {
         if (!_items.TryGetValue(key, out var set))
         {
-            return false;
+            return;
         }
 
         var updated = set.Remove(value);
         if (updated.Equals(set))
         {
-            return false;
+            return;
         }
 
         if (updated.Count == 0)
@@ -355,22 +448,17 @@ internal sealed class DurableOrderedSetLookup<TKey, TValue> : IDurableOrderedSet
         {
             _items[key] = updated;
         }
-
-        return true;
     }
 
-    private bool ApplyRemoveKey(TKey key) => _items.Remove(key);
+    private void ApplyRemoveKey(TKey key) => _items.Remove(key);
+
     private void ApplyClear() => _items.Clear();
 
-    private IStateMachineLogWriter GetStorage()
+    private JournalStreamWriter GetWriter()
     {
-        Debug.Assert(_storage is not null);
-        return _storage;
+        Debug.Assert(_writer.HasValue);
+        return _writer.Value;
     }
-
-    public IDurableStateMachine DeepCopy() => throw new NotImplementedException();
-
-    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 
     public IEnumerator<(TKey, IReadOnlyCollection<TValue>)> GetEnumerator()
     {
@@ -380,14 +468,7 @@ internal sealed class DurableOrderedSetLookup<TKey, TValue> : IDurableOrderedSet
         }
     }
 
-    private enum CommandType : uint
-    {
-        Clear = 0,
-        Snapshot = 1,
-        Add = 2,
-        RemoveKey = 3,
-        RemoveItem = 4
-    }
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 
     /// <summary>
     /// Initializes a new <see cref="OrderedValueSet"/> holding either a single value or, once more than one

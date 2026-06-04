@@ -1,6 +1,6 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Version 17
-VisualStudioVersion = 17.12.35506.116
+# Visual Studio Version 18
+VisualStudioVersion = 18.6.11819.183
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DurableStateMachines", "DurableStateMachines\DurableStateMachines.csproj", "{B3D6349F-A591-409D-BEC5-4557340F4D61}"
 EndProject
@@ -34,5 +34,8 @@ Global
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{2C91AFDD-4308-4491-949F-6578B856EEBE} = {8F58FC27-92EF-4B9C-8E65-F1663DE04942}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {C1BD5B17-0C7E-49B2-B186-A3CD963D2A4C}
 	EndGlobalSection
 EndGlobal

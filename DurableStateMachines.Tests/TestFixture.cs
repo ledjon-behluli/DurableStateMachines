@@ -1,11 +1,11 @@
-﻿global using Orleans.Journaling;
+﻿global using Ledjon.DurableStateMachines;
 global using Orleans.Core.Internal;
-global using Ledjon.DurableStateMachines;
-
-using System.Diagnostics.CodeAnalysis;
+global using Orleans.Journaling;
 using Microsoft.Extensions.DependencyInjection;
-using Orleans.TestingHost;
 using Microsoft.Extensions.Time.Testing;
+using Orleans.Journaling.Json;
+using Orleans.TestingHost;
+using System.Diagnostics.CodeAnalysis;
 
 namespace DurableStateMachines.Tests;
 
@@ -29,9 +29,10 @@ public class TestFixture : IAsyncLifetime
         
         builder.ConfigureSilo((options, siloBuilder) =>
         {
-            siloBuilder.AddStateMachineStorage();
+            siloBuilder.AddJournalStorage();
+            siloBuilder.Services.Configure<JournaledStateManagerOptions>(options => options.JournalFormatKey = "orleans-binary");
             siloBuilder.Services.AddSingleton<TimeProvider>(TimeProvider);
-            siloBuilder.Services.AddSingleton<IStateMachineStorageProvider>(_ => new VolatileStateMachineStorageProvider());
+            siloBuilder.Services.AddSingleton<IJournalStorageProvider, VolatileJournalStorageProvider>();
             siloBuilder.Services.AddDurableStateMachines();
         });
 

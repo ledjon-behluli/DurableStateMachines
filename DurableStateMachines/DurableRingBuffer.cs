@@ -1,5 +1,5 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
-using System.Buffers;
+using Microsoft.Extensions.Options;
 using System.Collections;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -106,200 +106,300 @@ public interface IDurableRingBuffer<T> : IEnumerable<T>, IReadOnlyCollection<T>
     void Clear();
 }
 
-[DebuggerDisplay("Count = {Count}, Capacity = {Capacity}, IsEmpty = {IsEmpty}, IsFull = {IsFull}")]
-[DebuggerTypeProxy(typeof(DurableRingBufferDebugView<>))]
-internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStateMachine
+/// <summary>
+/// Receives decoded durable ring buffer commands from a codec implementation.
+/// </summary>
+public interface IDurableRingBufferCommandHandler<T>
+{
+    /// <summary>Applies a set capacity command.</summary>
+    void ApplySetCapacity(int capacity);
+
+    /// <summary>Applies an enqueue command.</summary>
+    void ApplyEnqueue(T item);
+
+    /// <summary>Applies a try dequeue command.</summary>
+    void ApplyTryDequeue();
+
+    /// <summary>Applies a clear command.</summary>
+    void ApplyClear();
+
+    /// <summary>Resets the receiver before applying replacement entries.</summary>
+    void Reset(int capacity);
+}
+
+/// <summary>
+/// Serializes one durable ring buffer command and applies one decoded command.
+/// </summary>
+public interface IDurableRingBufferCommandCodec<T>
+{
+    /// <summary>Writes a set capacity command.</summary>
+    void WriteSetCapacity(int capacity, JournalStreamWriter writer);
+
+    /// <summary>Writes an enqueue command.</summary>
+    void WriteEnqueue(T item, JournalStreamWriter writer);
+
+    /// <summary>Writes a dequeue command.</summary>
+    void WriteDequeue(JournalStreamWriter writer);
+
+    /// <summary>Writes a clear command.</summary>
+    void WriteClear(JournalStreamWriter writer);
+
+    /// <summary>Writes a snapshot command.</summary>
+    void WriteSnapshot(int capacity, int count, IEnumerable<T> items, JournalStreamWriter writer);
+
+    /// <summary>Reads one encoded command and applies it to <paramref name="handler"/>.</summary>
+    void Apply(JournalBufferReader input, IDurableRingBufferCommandHandler<T> handler);
+}
+
+internal sealed class DurableRingBufferCommandBinaryCodec<T>(
+    IFieldCodec<T> codec, SerializerSessionPool sessionPool) : IDurableRingBufferCommandCodec<T>
 {
     private const byte VersionByte = 0;
 
-    private IStateMachineLogWriter? _storage;
-
-    private readonly RingBuffer<T> _buffer = new();
-    private readonly SerializerSessionPool _sessionPool;
-    private readonly IFieldCodec<T> _codec;
-
-    public DurableRingBuffer(
-        [ServiceKey] string key, IStateMachineManager manager,
-        IFieldCodec<T> codec, SerializerSessionPool sessionPool)
+    private enum CommandType : uint
     {
-        ArgumentException.ThrowIfNullOrEmpty(key);
-
-        _codec = codec;
-        _sessionPool = sessionPool;
-
-        manager.RegisterStateMachine(key, this);
+        Clear = 0,
+        Snapshot = 1,
+        SetCapacity = 2,
+        Enqueue = 3,
+        Dequeue = 4
     }
 
-    public int Count => _buffer.Count;
-    public int Capacity => _buffer.Capacity;
-    public bool IsEmpty => _buffer.IsEmpty;
-    public bool IsFull => _buffer.IsFull;
-    
-    void IDurableStateMachine.AppendEntries(StateMachineStorageWriter writer)
+    public void WriteSetCapacity(int capacity, JournalStreamWriter writer)
     {
-        // We use a push model, and append entries upon modification.
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.SetCapacity);
+
+        payloadWriter.WriteVarUInt32((uint)capacity);
+
+        payloadWriter.Commit();
+        entry.Commit();
     }
 
-    void IDurableStateMachine.Reset(IStateMachineLogWriter storage)
+    public void WriteEnqueue(T item, JournalStreamWriter writer)
     {
-        ApplyClear();
-        _storage = storage;
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Enqueue);
+
+        codec.WriteField(ref payloadWriter, 0, typeof(T), item);
+
+        payloadWriter.Commit();
+        entry.Commit();
     }
 
-    void IDurableStateMachine.Apply(ReadOnlySequence<byte> logEntry)
+    public void WriteDequeue(JournalStreamWriter writer)
     {
-        using var session = _sessionPool.GetSession();
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
 
-        var reader = Reader.Create(logEntry, session);
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Dequeue);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteClear(JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Clear);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteSnapshot(int capacity, int count, IEnumerable<T> items, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Snapshot);
+
+        payloadWriter.WriteVarUInt32((uint)count);
+        payloadWriter.WriteVarUInt32((uint)capacity);
+
+        foreach (var item in items)
+        {
+            codec.WriteField(ref payloadWriter, 0, typeof(T), item);
+        }
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void Apply(JournalBufferReader input, IDurableRingBufferCommandHandler<T> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+
+        using var slice = input.Peek(input.Length);
+        using var session = sessionPool.GetSession();
+
+        var reader = Reader.Create(slice, session);
         var version = reader.ReadByte();
 
         if (version != VersionByte)
         {
-            throw new NotSupportedException($"This instance of {nameof(DurableRingBuffer<T>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
+            throw new NotSupportedException($"This command codec supports version {(uint)VersionByte} and not version {(uint)version}.");
         }
 
         var command = (CommandType)reader.ReadVarUInt32();
 
         switch (command)
         {
-            case CommandType.SetCapacity: _ = ApplySetCapacity((int)reader.ReadVarUInt32()); break;
-            case CommandType.Enqueue: ApplyEnqueue(ReadValue(ref reader)); break;
-            case CommandType.Dequeue: _ = ApplyTryDequeue(out _); break;
-            case CommandType.Clear: _ = ApplyClear(); break;
-            case CommandType.Snapshot: ApplySnapshot(ref reader); break;
-            default: throw new NotSupportedException($"Command type {command} is not supported");
+            case CommandType.Clear: handler.ApplyClear(); break;
+            case CommandType.SetCapacity: handler.ApplySetCapacity((int)reader.ReadVarUInt32()); break;
+            case CommandType.Enqueue: handler.ApplyEnqueue(ReadValue(ref reader)); break;
+            case CommandType.Dequeue: handler.ApplyTryDequeue(); break;
+            case CommandType.Snapshot:
+                {
+                    var count = (int)reader.ReadVarUInt32();
+                    var capacity = (int)reader.ReadVarUInt32();
+
+                    // Since we support a dynamic capacity, we restore the buffer to the capacity it had when the snapshot was taken.
+                    handler.Reset(capacity);
+
+                    for (var i = 0; i < count; i++)
+                    {
+                        handler.ApplyEnqueue(ReadValue(ref reader));
+                    }
+                }
+                break;
+            default: Helpers.ThrowUnsupportedCommand(command); break;
         }
+
+        Helpers.ThrowIfTrailingData(ref reader);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        T ReadValue(ref Reader<ReadOnlySequenceInput> reader)
+        T ReadValue<TInput>(ref Reader<TInput> reader)
         {
             var field = reader.ReadFieldHeader();
-            return _codec.ReadValue(ref reader, field);
-        }
-
-        void ApplySnapshot(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var count = (int)reader.ReadVarUInt32();
-            var capacity = (int)reader.ReadVarUInt32();
-
-            //  Since we support a dynamic capacity, we restore the buffer to the capacity it had when the snapshot was taken.   
-            ApplySetCapacity(capacity); // This implicitly resets the buffer to the correct size.
-
-            for (var i = 0; i < count; i++)
-            {
-                ApplyEnqueue(ReadValue(ref reader));
-            }
+            return codec.ReadValue(ref reader, field);
         }
     }
+}
 
-    void IDurableStateMachine.AppendSnapshot(StateMachineStorageWriter writer)
+[DebuggerDisplay("Count = {Count}, Capacity = {Capacity}, IsEmpty = {IsEmpty}, IsFull = {IsFull}")]
+internal sealed class DurableRingBuffer<T> :
+    IDurableRingBuffer<T>,
+    IDurableRingBufferCommandHandler<T>,
+    IJournaledState
+{
+    private JournalStreamWriter? _writer;
+    private readonly RingBuffer<T> _buffer = new();
+    private readonly IDurableRingBufferCommandCodec<T> _codec;
+
+    public DurableRingBuffer(
+        [ServiceKey] string key, IJournaledStateManager manager,
+        IOptions<JournaledStateManagerOptions> options, IServiceProvider serviceProvider)
     {
-        writer.AppendEntry(static (self, bufferWriter) =>
-        {
-            using var session = self._sessionPool.GetSession();
-            
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)CommandType.Snapshot);
-            
-            writer.WriteVarUInt32((uint)self.Count);
-            writer.WriteVarUInt32((uint)self.Capacity);
-
-            foreach (var item in self)
-            {
-                self._codec.WriteField(ref writer, 0, typeof(T), item);
-            }
-
-            writer.Commit();
-        }, this);
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        _codec = Helpers.GetCodec<IDurableRingBufferCommandCodec<T>>(serviceProvider, options);
+        manager.RegisterState(key, this);
     }
+
+    public int Count => _buffer.Count;
+    public int Capacity => _buffer.Capacity;
+    public bool IsEmpty => _buffer.IsEmpty;
+    public bool IsFull => _buffer.IsFull;
+
+    #region IJournalState
+
+    IJournaledState IJournaledState.DeepCopy() => throw new NotImplementedException();
+
+    void IJournaledState.ReplayEntry(JournalEntry entry, JournalReplayContext context) =>
+        context.GetRequiredCommandCodec(entry.FormatKey, _codec).Apply(entry.Reader, this);
+
+    void IJournaledState.AppendEntries(JournalStreamWriter writer)
+    {
+        // We use a push model, and append entries upon modification.
+    }
+
+    void IJournaledState.AppendSnapshot(JournalStreamWriter snapshotWriter) => _codec.WriteSnapshot(Capacity, Count, _buffer, snapshotWriter);
+
+    void IJournaledState.Reset(JournalStreamWriter writer)
+    {
+        _buffer.Clear();
+        _writer = writer;
+    }
+
+    #endregion
+
+    #region IDurableRingBufferCommandHandler
+
+    void IDurableRingBufferCommandHandler<T>.ApplySetCapacity(int capacity) => _buffer.SetCapacity(capacity);
+    void IDurableRingBufferCommandHandler<T>.ApplyEnqueue(T item) => _buffer.Enqueue(item);
+    void IDurableRingBufferCommandHandler<T>.ApplyTryDequeue() => _buffer.TryDequeue(out _);
+    void IDurableRingBufferCommandHandler<T>.ApplyClear() => _buffer.Clear();
+    void IDurableRingBufferCommandHandler<T>.Reset(int capacity)
+    {
+        _buffer.Clear();
+        _buffer.SetCapacity(capacity);
+    }
+
+    #endregion
 
     public bool SetCapacity(int capacity)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity, nameof(capacity));
 
-        if (ApplySetCapacity(capacity))
+        if (capacity == _buffer.Capacity)
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, capacity) = state;
-               
-                using var session = self._sessionPool.GetSession();
-                
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)CommandType.SetCapacity);
-                
-                writer.WriteVarUInt32((uint)capacity);
-                
-                writer.Commit();
-            }, (this, capacity));
-
-            return true;
+            return false;
         }
 
-        return false;
+        _codec.WriteSetCapacity(capacity, GetWriter());
+        _buffer.SetCapacity(capacity);
+
+        return true;
     }
 
     public void Enqueue(T item)
     {
-        ApplyEnqueue(item);
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            var (self, item) = state;
-
-            using var session = self._sessionPool.GetSession();
-            
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)CommandType.Enqueue);
-            
-            self._codec.WriteField(ref writer, 0, typeof(T), item);
-            
-            writer.Commit();
-        }, (this, item));
+        _codec.WriteEnqueue(item, GetWriter());
+        _buffer.Enqueue(item);
     }
 
     public bool TryDequeue([MaybeNullWhen(false)] out T item)
     {
-        if (ApplyTryDequeue(out item))
+        if (_buffer.IsEmpty)
         {
-            GetStorage().AppendEntry(static (self, bufferWriter) =>
-            {
-                using var session = self._sessionPool.GetSession();
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)CommandType.Dequeue);
-
-                writer.Commit();
-            }, this);
-
-            return true;
+            item = default;
+            return false;
         }
 
-        return false;
+        _codec.WriteDequeue(GetWriter());
+        return _buffer.TryDequeue(out item);
     }
 
     public void Clear()
     {
-        if (ApplyClear())
+        if (_buffer.IsEmpty)
         {
-            GetStorage().AppendEntry(static (self, bufferWriter) =>
-            {
-                using var session = self._sessionPool.GetSession();
-
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)CommandType.Clear);
-
-                writer.Commit();
-            }, this);
+            return;
         }
+
+        _codec.WriteClear(GetWriter());
+        _buffer.Clear();
     }
 
     public bool Contains(T item) => _buffer.Contains(item);
@@ -319,33 +419,18 @@ internal sealed class DurableRingBuffer<T> : IDurableRingBuffer<T>, IDurableStat
         {
             Clear(); // We durably log this by means of clearing the buffer.
         }
+
         return count;
     }
 
-    private bool ApplySetCapacity(int capacity) => _buffer.SetCapacity(capacity);
-    private void ApplyEnqueue(T item) => _buffer.Enqueue(item);
-    private bool ApplyTryDequeue(out T item) => _buffer.TryDequeue(out item!);
-    private bool ApplyClear() => _buffer.Clear();
-
-    private IStateMachineLogWriter GetStorage()
+    private JournalStreamWriter GetWriter()
     {
-        Debug.Assert(_storage is not null);
-        return _storage;
+        Debug.Assert(_writer.HasValue);
+        return _writer.Value;
     }
-
-    public IDurableStateMachine DeepCopy() => throw new NotImplementedException();
 
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     public IEnumerator<T> GetEnumerator() => _buffer.GetEnumerator();
-
-    public enum CommandType : uint
-    {
-        Clear = 0,
-        Snapshot = 1,
-        SetCapacity = 2,
-        Enqueue = 3,
-        Dequeue = 4
-    }
 }
 
 internal sealed class DurableRingBufferDebugView<T>(DurableRingBuffer<T> buffer)

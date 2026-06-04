@@ -1,9 +1,9 @@
-﻿using System.Buffers;
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using System.Collections;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
-using Microsoft.Extensions.DependencyInjection;
 
 namespace Ledjon.DurableStateMachines;
 
@@ -101,210 +101,309 @@ public interface IDurableTimeWindowBuffer<T> : IEnumerable<T>, IReadOnlyCollecti
     void Clear();
 }
 
-[DebuggerDisplay("Count = {Count}, IsEmpty = {IsEmpty}, Window = {Window}")]
-[DebuggerTypeProxy(typeof(DurableTimeWindowBufferDebugView<>))]
-internal sealed class DurableTimeWindowBuffer<T> : IDurableTimeWindowBuffer<T>, IDurableStateMachine
+/// <summary>
+/// Receives decoded durable time window buffer commands from a codec implementation.
+/// </summary>
+public interface IDurableTimeWindowBufferCommandHandler<T>
+{
+    /// <summary>Applies a set window command.</summary>
+    void ApplySetWindow(long windowSeconds);
+
+    /// <summary>Applies an enqueue command.</summary>
+    void ApplyEnqueue(T item, long timestamp);
+
+    /// <summary>Applies a try dequeue command.</summary>
+    void ApplyTryDequeue();
+
+    /// <summary>Applies a clear command.</summary>
+    void ApplyClear();
+
+    /// <summary>Resets the receiver before applying replacement entries.</summary>
+    void Reset(long windowSeconds);
+}
+
+/// <summary>
+/// Serializes one durable time window buffer command and applies one decoded command.
+/// </summary>
+public interface IDurableTimeWindowBufferCommandCodec<T>
+{
+    /// <summary>Writes a set window command.</summary>
+    void WriteSetWindow(long windowSeconds, JournalStreamWriter writer);
+
+    /// <summary>Writes an enqueue command.</summary>
+    void WriteEnqueue(T item, long timestamp, JournalStreamWriter writer);
+
+    /// <summary>Writes a dequeue command.</summary>
+    void WriteDequeue(JournalStreamWriter writer);
+
+    /// <summary>Writes a clear command.</summary>
+    void WriteClear(JournalStreamWriter writer);
+
+    /// <summary>Writes a snapshot command.</summary>
+    void WriteSnapshot(long windowSeconds, int count, IEnumerable<(T Item, long Timestamp)> items, JournalStreamWriter writer);
+
+    /// <summary>Reads one encoded command and applies it to <paramref name="handler"/>.</summary>
+    void Apply(JournalBufferReader input, IDurableTimeWindowBufferCommandHandler<T> handler);
+}
+
+internal sealed class DurableTimeWindowBufferCommandBinaryCodec<T>(
+    IFieldCodec<T> codec, SerializerSessionPool sessionPool) : IDurableTimeWindowBufferCommandCodec<T>
 {
     private const byte VersionByte = 0;
 
-    private IStateMachineLogWriter? _storage;
-
-    private readonly TimeWindowBuffer<T> _buffer = new();
-    private readonly SerializerSessionPool _sessionPool;
-    private readonly TimeProvider _timeProvider;
-    private readonly IFieldCodec<T> _codec;
-
-    public DurableTimeWindowBuffer(
-        [ServiceKey] string key, IStateMachineManager manager,
-        IFieldCodec<T> codec, SerializerSessionPool sessionPool, TimeProvider timeProvider)
+    private enum CommandType : uint
     {
-        ArgumentException.ThrowIfNullOrEmpty(key);
-
-        _codec = codec;
-        _sessionPool = sessionPool;
-        _timeProvider = timeProvider;
-
-        manager.RegisterStateMachine(key, this);
+        Clear = 0,
+        Snapshot = 1,
+        SetWindow = 2,
+        Enqueue = 3,
+        Dequeue = 4
     }
 
-    public int Count => _buffer.Count;
-    public bool IsEmpty => _buffer.IsEmpty;
-    public TimeSpan Window => TimeSpan.FromSeconds(_buffer.WindowSeconds);
-
-    void IDurableStateMachine.AppendEntries(StateMachineStorageWriter writer)
+    public void WriteSetWindow(long windowSeconds, JournalStreamWriter writer)
     {
-        // We use a push model, and append entries upon modification.
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.SetWindow);
+
+        payloadWriter.WriteVarUInt64((ulong)windowSeconds);
+
+        payloadWriter.Commit();
+        entry.Commit();
     }
 
-    void IDurableStateMachine.Reset(IStateMachineLogWriter storage)
+    public void WriteEnqueue(T item, long timestamp, JournalStreamWriter writer)
     {
-        ApplyClear();
-        _storage = storage;
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Enqueue);
+
+        codec.WriteField(ref payloadWriter, 0, typeof(T), item);
+        payloadWriter.WriteVarUInt64((ulong)timestamp);
+
+        payloadWriter.Commit();
+        entry.Commit();
     }
 
-    void IDurableStateMachine.Apply(ReadOnlySequence<byte> logEntry)
+    public void WriteDequeue(JournalStreamWriter writer)
     {
-        using var session = _sessionPool.GetSession();
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
 
-        var reader = Reader.Create(logEntry, session);
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Dequeue);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteClear(JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Clear);
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void WriteSnapshot(long windowSeconds, int count, IEnumerable<(T Item, long Timestamp)> items, JournalStreamWriter writer)
+    {
+        using var entry = writer.BeginEntry();
+        using var session = sessionPool.GetSession();
+
+        var payloadWriter = Writer.Create(entry.Writer, session);
+
+        payloadWriter.WriteByte(VersionByte);
+        payloadWriter.WriteVarUInt32((uint)CommandType.Snapshot);
+
+        payloadWriter.WriteVarUInt64((ulong)windowSeconds);
+        payloadWriter.WriteVarUInt32((uint)count);
+
+        foreach (var (item, timestamp) in items)
+        {
+            codec.WriteField(ref payloadWriter, 0, typeof(T), item);
+            payloadWriter.WriteVarUInt64((ulong)timestamp);
+        }
+
+        payloadWriter.Commit();
+        entry.Commit();
+    }
+
+    public void Apply(JournalBufferReader input, IDurableTimeWindowBufferCommandHandler<T> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+
+        using var slice = input.Peek(input.Length);
+        using var session = sessionPool.GetSession();
+
+        var reader = Reader.Create(slice, session);
         var version = reader.ReadByte();
 
         if (version != VersionByte)
         {
-            throw new NotSupportedException($"This instance of {nameof(DurableTimeWindowBuffer<T>)} supports version {(uint)VersionByte} and not version {(uint)version}.");
+            throw new NotSupportedException($"This command codec supports version {(uint)VersionByte} and not version {(uint)version}.");
         }
 
         var command = (CommandType)reader.ReadVarUInt32();
 
         switch (command)
         {
-            case CommandType.SetWindow: _ = ApplySetWindow((long)reader.ReadVarUInt64()); break;
-            case CommandType.Enqueue: ApplyEnqueue(ReadValue(ref reader), (long)reader.ReadVarUInt64()); break;
-            case CommandType.Dequeue: _ = ApplyTryDequeue(out _); break;
-            case CommandType.Clear: _ = ApplyClear(); break;
-            case CommandType.Snapshot: ApplySnapshot(ref reader); break;
-            default: throw new NotSupportedException($"Command type is not supported");
+            case CommandType.Clear: handler.ApplyClear(); break;
+            case CommandType.SetWindow: handler.ApplySetWindow((long)reader.ReadVarUInt64()); break;
+            case CommandType.Enqueue: handler.ApplyEnqueue(ReadValue(ref reader), (long)reader.ReadVarUInt64()); break;
+            case CommandType.Dequeue: handler.ApplyTryDequeue(); break;
+            case CommandType.Snapshot:
+                {
+                    var windowSeconds = (long)reader.ReadVarUInt64();
+                    var count = (int)reader.ReadVarUInt32();
+
+                    handler.Reset(windowSeconds);
+
+                    for (var i = 0; i < count; i++)
+                    {
+                        var item = ReadValue(ref reader);
+                        var timestamp = (long)reader.ReadVarUInt64();
+
+                        handler.ApplyEnqueue(item, timestamp);
+                    }
+                }
+                break;
+            default: Helpers.ThrowUnsupportedCommand(command); break;
         }
+
+        Helpers.ThrowIfTrailingData(ref reader);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        T ReadValue(ref Reader<ReadOnlySequenceInput> reader)
+        T ReadValue<TInput>(ref Reader<TInput> reader)
         {
             var field = reader.ReadFieldHeader();
-            return _codec.ReadValue(ref reader, field);
-        }
-
-        void ApplySnapshot(ref Reader<ReadOnlySequenceInput> reader)
-        {
-            var windowSeconds = (long)reader.ReadVarUInt64();
-            var count = (int)reader.ReadVarUInt32();
-
-            ApplySetWindow(windowSeconds);
-
-            for (var i = 0; i < count; i++)
-            {
-                var item = ReadValue(ref reader);
-                var timestamp = (long)reader.ReadVarUInt64();
-
-                ApplyEnqueue(item, timestamp);
-            }
+            return codec.ReadValue(ref reader, field);
         }
     }
+}
 
-    void IDurableStateMachine.AppendSnapshot(StateMachineStorageWriter writer)
+[DebuggerDisplay("Count = {Count}, IsEmpty = {IsEmpty}, Window = {Window}")]
+internal sealed class DurableTimeWindowBuffer<T> :
+    IDurableTimeWindowBuffer<T>,
+    IDurableTimeWindowBufferCommandHandler<T>,
+    IJournaledState
+{
+    private JournalStreamWriter? _writer;
+    private readonly TimeWindowBuffer<T> _buffer = new();
+    private readonly TimeProvider _timeProvider;
+    private readonly IDurableTimeWindowBufferCommandCodec<T> _codec;
+
+    public DurableTimeWindowBuffer(
+        [ServiceKey] string key, IJournaledStateManager manager,
+        IOptions<JournaledStateManagerOptions> options, TimeProvider timeProvider,
+        IServiceProvider serviceProvider)
     {
-        writer.AppendEntry(static (self, bufferWriter) =>
-        {
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)CommandType.Snapshot);
-
-            writer.WriteVarUInt64((ulong)self._buffer.WindowSeconds);
-            writer.WriteVarUInt32((uint)self.Count);
-
-            foreach (var (item, timestamp) in self._buffer.GetEntries())
-            {
-                self._codec.WriteField(ref writer, 0, typeof(T), item);
-                writer.WriteVarUInt64((ulong)timestamp);
-            }
-
-            writer.Commit();
-        }, this);
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        _timeProvider = timeProvider;
+        _codec = Helpers.GetCodec<IDurableTimeWindowBufferCommandCodec<T>>(serviceProvider, options);
+        manager.RegisterState(key, this);
     }
+
+    public int Count => _buffer.Count;
+    public bool IsEmpty => _buffer.IsEmpty;
+    public TimeSpan Window => TimeSpan.FromSeconds(_buffer.WindowSeconds);
+
+    #region IJournalState
+
+    IJournaledState IJournaledState.DeepCopy() => throw new NotImplementedException();
+
+    void IJournaledState.ReplayEntry(JournalEntry entry, JournalReplayContext context) =>
+        context.GetRequiredCommandCodec(entry.FormatKey, _codec).Apply(entry.Reader, this);
+
+    void IJournaledState.AppendEntries(JournalStreamWriter writer)
+    {
+        // We use a push model, and append entries upon modification.
+    }
+
+    void IJournaledState.AppendSnapshot(JournalStreamWriter snapshotWriter) => _codec.WriteSnapshot(_buffer.WindowSeconds, Count, _buffer.GetEntries(), snapshotWriter);
+
+    void IJournaledState.Reset(JournalStreamWriter writer)
+    {
+        _buffer.Clear();
+        _writer = writer;
+    }
+
+    #endregion
+
+    #region IDurableTimeWindowBufferCommandHandler
+
+    void IDurableTimeWindowBufferCommandHandler<T>.ApplySetWindow(long windowSeconds) => _buffer.SetWindow(windowSeconds, _timeProvider.GetUtcNow().ToUnixTimeSeconds());
+    void IDurableTimeWindowBufferCommandHandler<T>.ApplyEnqueue(T item, long timestamp) => _buffer.Enqueue(item, timestamp);
+    void IDurableTimeWindowBufferCommandHandler<T>.ApplyTryDequeue() => _buffer.TryDequeue(out _);
+    void IDurableTimeWindowBufferCommandHandler<T>.ApplyClear() => _buffer.Clear();
+    void IDurableTimeWindowBufferCommandHandler<T>.Reset(long windowSeconds)
+    {
+        _buffer.Clear();
+        _buffer.SetWindow(windowSeconds, _timeProvider.GetUtcNow().ToUnixTimeSeconds());
+    }
+
+    #endregion
 
     public bool SetWindow(TimeSpan window)
     {
         var windowSeconds = (long)window.TotalSeconds;
-
         TimeWindowBuffer<T>.ThrowIfTooShortWindow(windowSeconds);
 
-        if (ApplySetWindow(windowSeconds))
+        if (windowSeconds == _buffer.WindowSeconds)
         {
-            GetStorage().AppendEntry(static (state, bufferWriter) =>
-            {
-                var (self, windowSeconds) = state;
-
-                using var session = self._sessionPool.GetSession();
-
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)CommandType.SetWindow);
-
-                writer.WriteVarUInt64((ulong)windowSeconds);
-
-                writer.Commit();
-            }, (this, windowSeconds));
-
-            return true;
+            return false;
         }
 
-        return false;
+        _codec.WriteSetWindow(windowSeconds, GetWriter());
+        _buffer.SetWindow(windowSeconds, _timeProvider.GetUtcNow().ToUnixTimeSeconds());
+
+        return true;
     }
 
     public void Enqueue(T item)
     {
         var timestamp = _timeProvider.GetUtcNow().ToUnixTimeSeconds();
 
-        ApplyEnqueue(item, timestamp);
-        GetStorage().AppendEntry(static (state, bufferWriter) =>
-        {
-            var (self, item, timestamp) = state;
-
-            using var session = self._sessionPool.GetSession();
-
-            var writer = Writer.Create(bufferWriter, session);
-
-            writer.WriteByte(VersionByte);
-            writer.WriteVarUInt32((uint)CommandType.Enqueue);
-
-            self._codec.WriteField(ref writer, 0, typeof(T), item);
-            writer.WriteVarUInt64((ulong)timestamp);
-
-            writer.Commit();
-        }, (this, item, timestamp));
+        _codec.WriteEnqueue(item, timestamp, GetWriter());
+        _buffer.Enqueue(item, timestamp);
     }
 
     public bool TryDequeue([MaybeNullWhen(false)] out T item)
     {
-        if (ApplyTryDequeue(out item))
+        if (_buffer.IsEmpty)
         {
-            GetStorage().AppendEntry(static (self, bufferWriter) =>
-            {
-                using var session = self._sessionPool.GetSession();
-
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)CommandType.Dequeue);
-
-                writer.Commit();
-            }, this);
-
-            return true;
+            item = default;
+            return false;
         }
 
-        return false;
+        _codec.WriteDequeue(GetWriter());
+        return _buffer.TryDequeue(out item);
     }
 
     public void Clear()
     {
-        if (ApplyClear())
+        if (_buffer.IsEmpty)
         {
-            GetStorage().AppendEntry(static (self, bufferWriter) =>
-            {
-                using var session = self._sessionPool.GetSession();
-
-                var writer = Writer.Create(bufferWriter, session);
-
-                writer.WriteByte(VersionByte);
-                writer.WriteVarUInt32((uint)CommandType.Clear);
-
-                writer.Commit();
-            }, this);
+            return;
         }
+
+        _codec.WriteClear(GetWriter());
+        _buffer.Clear();
     }
 
     public bool Contains(T item) => _buffer.Contains(item);
@@ -324,33 +423,18 @@ internal sealed class DurableTimeWindowBuffer<T> : IDurableTimeWindowBuffer<T>, 
         {
             Clear(); // We durably log this by means of clearing the buffer.
         }
+
         return count;
     }
 
-    private bool ApplySetWindow(long windowSeconds) => _buffer.SetWindow(windowSeconds, _timeProvider.GetUtcNow().ToUnixTimeSeconds());
-    private void ApplyEnqueue(T item, long timestamp) => _buffer.Enqueue(item, timestamp);
-    private bool ApplyTryDequeue(out T item) => _buffer.TryDequeue(out item!);
-    private bool ApplyClear() => _buffer.Clear();
-
-    private IStateMachineLogWriter GetStorage()
+    private JournalStreamWriter GetWriter()
     {
-        Debug.Assert(_storage is not null);
-        return _storage;
+        Debug.Assert(_writer.HasValue);
+        return _writer.Value;
     }
-
-    public IDurableStateMachine DeepCopy() => throw new NotImplementedException();
 
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     public IEnumerator<T> GetEnumerator() => _buffer.GetEnumerator();
-
-    public enum CommandType : uint
-    {
-        Clear = 0,
-        Snapshot = 1,
-        SetWindow = 2,
-        Enqueue = 3,
-        Dequeue = 4
-    }
 }
 
 internal sealed class DurableTimeWindowBufferDebugView<T>(DurableTimeWindowBuffer<T> buffer)
