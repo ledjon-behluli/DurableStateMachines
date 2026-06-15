@@ -10,11 +10,19 @@ A suite of high-performance, specialized durable state machines for [Microsoft O
 
 ### Registration
 
-In your silo configuration, register the state machines.
+In your silo configuration, register the state machines along with the Orleans journal storage.
+
+Orleans currently defaults to using JSON Lines (`"json"`) for its default journal format. However, this package provides built-in codecs exclusively for the `"orleans-binary"` format.
+
+You must explicitly configure the `JournaledStateManagerOptions` to use the binary format globally.
 
 ```csharp
+siloBuilder.AddJournalStorage();
 siloBuilder.Services.AddDurableStateMachines();
+siloBuilder.Services.Configure<JournaledStateManagerOptions>(o => o.JournalFormatKey = "orleans-binary");
 ```
+
+If your project requires JSON or another custom format, you can implement the handler and codec interfaces yourself, and register them in your DI container as a keyed singleton under your preferred format key.
 
 ### Usage
 
