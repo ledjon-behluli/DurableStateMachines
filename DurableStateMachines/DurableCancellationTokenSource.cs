@@ -422,7 +422,7 @@ internal sealed class DurableCancellationTokenSource :
     /// (durability comes after WriteStateAsync is called) to reflect the scheduled cancellation has occurred.
     /// </para>
     /// <para>
-    /// We use <see cref="CancellationToken.UnsafeRegister(Action{object?}, object?)"/> because the <see cref="IStateMachineManager"/>
+    /// We use <see cref="CancellationToken.UnsafeRegister(Action{object?}, object?)"/> because the <see cref="IJournaledStateManager"/>
     /// already suppresses the execution context, so there is no context to flow anyway.
     /// </para>
     /// </remarks>
