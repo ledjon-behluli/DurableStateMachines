@@ -29,7 +29,7 @@ internal static class Helpers
 
         if (serviceProvider.GetKeyedService<TCodec>(formatKey) is not { } codec)
         {
-            throw new InvalidOperationException(
+            throw new NotSupportedException(
                 $"'Ledjon.DurableStateMachines' does not include a built-in codec for the '{formatKey}' journal format. " +
                 $"Orleans requires an implementation of '{typeof(TCodec).Name}', but none was registered under the '{formatKey}' key.\n\n" +
                 $"To fix this, you have two options:\n" +
