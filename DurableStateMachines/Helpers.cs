@@ -34,7 +34,7 @@ internal static class Helpers
                 $"Orleans requires an implementation of '{typeof(TCodec).Name}', but none was registered under the '{formatKey}' key.\n\n" +
                 $"To fix this, you have two options:\n" +
                 $"1. Configure Orleans to use the binary format globally (if suitable for your app):\n" +
-                $"   siloBuilder.AddJournalStorage(options => options.JournalFormatKey = \"orleans-binary\");\n" +
+                $"siloBuilder.Services.Configure<JournaledStateManagerOptions>(options => options.JournalFormatKey = \"orleans-binary\");\n" +
                 $"2. Implement '{typeof(TCodec).Name}' yourself and register it in your DI container as a KeyedSingleton under the \"{formatKey}\" key.");
         }
 
